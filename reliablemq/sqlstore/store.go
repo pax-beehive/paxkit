@@ -12,7 +12,10 @@ import (
 	"github.com/pax-beehive/paxkit/reliablemq"
 )
 
-const DefaultTableName = "reliablemq_frames"
+const (
+	DefaultTableName           = "reliablemq_frames"
+	DefaultQueueStateTableName = "reliablemq_frames_queue_state"
+)
 
 type Option func(*config)
 
@@ -27,9 +30,10 @@ func WithTableName(tableName string) Option {
 }
 
 type Store struct {
-	db        *sql.DB
-	tableName string
-	dialect   dialect
+	db                  *sql.DB
+	tableName           string
+	queueStateTableName string
+	dialect             dialect
 }
 
 type dialectName string
@@ -45,7 +49,9 @@ type dialect interface {
 	insertIgnoreSuffix() string
 	bind(int) string
 	createTableSQL(string) string
+	createQueueStateTableSQL(string) string
 	createReplayIndexSQL(string) string
+	selectForUpdateSuffix() string
 }
 
 type sqliteDialect struct{}
@@ -54,6 +60,9 @@ func (sqliteDialect) name() dialectName          { return dialectSQLite }
 func (sqliteDialect) insertIgnorePrefix() string { return "INSERT OR IGNORE" }
 func (sqliteDialect) insertIgnoreSuffix() string { return "" }
 func (sqliteDialect) bind(int) string            { return "?" }
+func (sqliteDialect) selectForUpdateSuffix() string {
+	return ""
+}
 func (sqliteDialect) createTableSQL(table string) string {
 	return `
 		CREATE TABLE IF NOT EXISTS ` + table + ` (
@@ -71,7 +80,20 @@ func (sqliteDialect) createTableSQL(table string) string {
 			updated_at TEXT NOT NULL,
 			UNIQUE(queue_id, stream, seq, direction)
 		)
-	`
+		`
+}
+func (sqliteDialect) createQueueStateTableSQL(table string) string {
+	return `
+			CREATE TABLE IF NOT EXISTS ` + table + ` (
+				queue_id TEXT NOT NULL,
+				stream TEXT NOT NULL,
+				next_outbound_seq INTEGER NOT NULL DEFAULT 1,
+				inbound_applied_through INTEGER NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (queue_id, stream)
+			)
+		`
 }
 func (sqliteDialect) createReplayIndexSQL(table string) string {
 	return `
@@ -88,6 +110,9 @@ func (postgresDialect) insertIgnoreSuffix() string {
 	return "ON CONFLICT (queue_id, stream, seq, direction) DO NOTHING"
 }
 func (postgresDialect) bind(n int) string { return fmt.Sprintf("$%d", n) }
+func (postgresDialect) selectForUpdateSuffix() string {
+	return " FOR UPDATE"
+}
 func (postgresDialect) createTableSQL(table string) string {
 	return `
 		CREATE TABLE IF NOT EXISTS ` + table + ` (
@@ -105,7 +130,20 @@ func (postgresDialect) createTableSQL(table string) string {
 			updated_at TEXT NOT NULL,
 			UNIQUE(queue_id, stream, seq, direction)
 		)
-	`
+		`
+}
+func (postgresDialect) createQueueStateTableSQL(table string) string {
+	return `
+			CREATE TABLE IF NOT EXISTS ` + table + ` (
+				queue_id TEXT NOT NULL,
+				stream TEXT NOT NULL,
+				next_outbound_seq BIGINT NOT NULL DEFAULT 1,
+				inbound_applied_through BIGINT NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (queue_id, stream)
+			)
+		`
 }
 func (postgresDialect) createReplayIndexSQL(table string) string {
 	return `
@@ -141,11 +179,26 @@ func newStore(db *sql.DB, d dialect, opts ...Option) (*Store, error) {
 	if !identifierPattern.MatchString(tableName) {
 		return nil, fmt.Errorf("sqlstore: invalid table name %q", tableName)
 	}
-	store := &Store{db: db, tableName: tableName, dialect: d}
+	store := &Store{
+		db:                  db,
+		tableName:           tableName,
+		queueStateTableName: queueStateTableName(tableName),
+		dialect:             d,
+	}
 	if err := store.migrate(context.Background()); err != nil {
 		return nil, err
 	}
 	return store, nil
+}
+
+func queueStateTableName(tableName string) string {
+	if tableName == "transport_journal" {
+		return "transport_queue_state"
+	}
+	if tableName == DefaultTableName {
+		return DefaultQueueStateTableName
+	}
+	return tableName + "_queue_state"
 }
 
 func (s *Store) AppendOutboundData(
@@ -192,6 +245,18 @@ func (s *Store) SaveInboundIfAbsent(
 		return false, reliablemq.Frame{}, err
 	}
 	defer rollback(tx)
+
+	applied, err := s.inboundAppliedThroughTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream)
+	if err != nil {
+		return false, reliablemq.Frame{}, err
+	}
+	if frame.Key.Seq <= applied {
+		frame.Status = reliablemq.StatusApplied
+		if err := tx.Commit(); err != nil {
+			return false, reliablemq.Frame{}, err
+		}
+		return false, frame, nil
+	}
 
 	inserted, err := s.insertFrame(ctx, tx, frame)
 	if err != nil {
@@ -257,7 +322,20 @@ func (s *Store) AckOutboundThrough(
 }
 
 func (s *Store) MarkApplied(ctx context.Context, key reliablemq.FrameKey) error {
-	return s.updateStatus(ctx, key, reliablemq.StatusApplied, "")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	if err := s.updateStatusTx(ctx, tx, key, reliablemq.StatusApplied, ""); err != nil {
+		return err
+	}
+	if key.Direction == reliablemq.DirectionInbound {
+		if err := s.updateInboundAppliedThroughTx(ctx, tx, key.QueueID, key.Stream, key.Seq); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) MarkRejected(ctx context.Context, key reliablemq.FrameKey, errorMessage string) error {
@@ -304,6 +382,9 @@ func (s *Store) Get(ctx context.Context, key reliablemq.FrameKey) (reliablemq.Fr
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, s.dialect.createTableSQL(s.tableName))
 	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, s.dialect.createQueueStateTableSQL(s.queueStateTableName)); err != nil {
 		return err
 	}
 	if err := s.validateSchema(ctx); err != nil {
@@ -559,13 +640,8 @@ func (s *Store) appendOutbound(
 	}
 	defer rollback(tx)
 
-	var seq int64
-	b := s.dialect.bind
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COALESCE(MAX(seq), 0) + 1
-		FROM `+s.tableName+`
-		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+` AND direction = `+b(3)+`
-	`, queueID, string(stream), string(reliablemq.DirectionOutbound)).Scan(&seq); err != nil {
+	seq, err := s.allocateOutboundSeqTx(ctx, tx, queueID, stream)
+	if err != nil {
 		return reliablemq.Frame{}, err
 	}
 	now := time.Now().UTC()
@@ -594,6 +670,106 @@ func (s *Store) appendOutbound(
 		return reliablemq.Frame{}, err
 	}
 	return frame, nil
+}
+
+func (s *Store) allocateOutboundSeqTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueID string,
+	stream reliablemq.Stream,
+) (int64, error) {
+	if err := s.ensureQueueStateTx(ctx, tx, queueID, stream); err != nil {
+		return 0, err
+	}
+	b := s.dialect.bind
+	var seq int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT next_outbound_seq
+		FROM `+s.queueStateTableName+`
+		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+s.dialect.selectForUpdateSuffix()+`
+	`, queueID, string(stream)).Scan(&seq); err != nil {
+		return 0, err
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE `+s.queueStateTableName+`
+		SET next_outbound_seq = next_outbound_seq + 1, updated_at = `+b(1)+`
+		WHERE queue_id = `+b(2)+` AND stream = `+b(3)+`
+	`, formatTime(time.Now().UTC()), queueID, string(stream))
+	if err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func (s *Store) ensureQueueStateTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueID string,
+	stream reliablemq.Stream,
+) error {
+	now := formatTime(time.Now().UTC())
+	b := s.dialect.bind
+	_, err := tx.ExecContext(ctx, `
+		`+s.dialect.insertIgnorePrefix()+` INTO `+s.queueStateTableName+` (
+			queue_id, stream, next_outbound_seq, inbound_applied_through, created_at, updated_at
+		)
+		SELECT `+b(1)+`, `+b(2)+`, COALESCE(MAX(seq), 0) + 1, 0, `+b(3)+`, `+b(4)+`
+		FROM `+s.tableName+`
+		WHERE queue_id = `+b(5)+` AND stream = `+b(6)+` AND direction = `+b(7)+`
+		`+queueStateInsertIgnoreSuffix(s.dialect)+`
+	`, queueID, string(stream), now, now, queueID, string(stream), string(reliablemq.DirectionOutbound))
+	return err
+}
+
+func queueStateInsertIgnoreSuffix(d dialect) string {
+	if d.name() == dialectPostgres {
+		return "ON CONFLICT (queue_id, stream) DO NOTHING"
+	}
+	return ""
+}
+
+func (s *Store) inboundAppliedThroughTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueID string,
+	stream reliablemq.Stream,
+) (int64, error) {
+	if err := s.ensureQueueStateTx(ctx, tx, queueID, stream); err != nil {
+		return 0, err
+	}
+	b := s.dialect.bind
+	var applied int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT inbound_applied_through
+		FROM `+s.queueStateTableName+`
+		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+`
+	`, queueID, string(stream)).Scan(&applied); err != nil {
+		return 0, err
+	}
+	return applied, nil
+}
+
+func (s *Store) updateInboundAppliedThroughTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueID string,
+	stream reliablemq.Stream,
+	seq int64,
+) error {
+	if err := s.ensureQueueStateTx(ctx, tx, queueID, stream); err != nil {
+		return err
+	}
+	b := s.dialect.bind
+	_, err := tx.ExecContext(ctx, `
+		UPDATE `+s.queueStateTableName+`
+		SET inbound_applied_through = CASE
+				WHEN inbound_applied_through < `+b(1)+` THEN `+b(2)+`
+				ELSE inbound_applied_through
+			END,
+			updated_at = `+b(3)+`
+		WHERE queue_id = `+b(4)+` AND stream = `+b(5)+`
+	`, seq, seq, formatTime(time.Now().UTC()), queueID, string(stream))
+	return err
 }
 
 func (s *Store) insertFrame(ctx context.Context, tx *sql.Tx, frame reliablemq.Frame) (bool, error) {
@@ -669,8 +845,26 @@ func (s *Store) list(
 }
 
 func (s *Store) updateStatus(ctx context.Context, key reliablemq.FrameKey, status reliablemq.Status, errorMessage string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	if err := s.updateStatusTx(ctx, tx, key, status, errorMessage); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) updateStatusTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	key reliablemq.FrameKey,
+	status reliablemq.Status,
+	errorMessage string,
+) error {
 	b := s.dialect.bind
-	result, err := s.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		UPDATE `+s.tableName+`
 		SET status = `+b(1)+`, error_message = `+b(2)+`, updated_at = `+b(3)+`
 		WHERE queue_id = `+b(4)+` AND stream = `+b(5)+`

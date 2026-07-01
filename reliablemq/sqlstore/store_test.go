@@ -22,6 +22,7 @@ func TestNewDefaultTable(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, store)
 	require.True(t, sqliteTableExists(t, db, DefaultTableName))
+	require.True(t, sqliteTableExists(t, db, DefaultQueueStateTableName))
 	require.True(t, sqliteIndexExists(t, db, DefaultTableName+"_replay_idx"))
 }
 
@@ -36,6 +37,7 @@ func TestNewCustomTable(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, store)
 	require.True(t, sqliteTableExists(t, db, "custom_reliablemq_frames"))
+	require.True(t, sqliteTableExists(t, db, "custom_reliablemq_frames_queue_state"))
 	require.False(t, sqliteTableExists(t, db, DefaultTableName))
 }
 
@@ -249,6 +251,29 @@ func TestAppendOutboundSeqScopes(t *testing.T) {
 	require.Equal(t, int64(1), control.Key.Seq)
 }
 
+func TestAppendOutboundSeqDoesNotReuseSweptJournalRows(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	first, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{"n":1}`), nil)
+	require.NoError(t, err)
+	second, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{"n":2}`), nil)
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2}, []int64{first.Key.Seq, second.Key.Seq})
+	_, err = db.Exec(`DELETE FROM reliablemq_frames WHERE queue_id = ? AND stream = ? AND direction = ?`,
+		"conn_1", string(reliablemq.StreamACP), string(reliablemq.DirectionOutbound))
+	require.NoError(t, err)
+
+	// When
+	third, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{"n":3}`), nil)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(3), third.Key.Seq)
+}
+
 func TestSaveInboundIfAbsent(t *testing.T) {
 	// Given
 	store := newTestStore(t)
@@ -275,6 +300,35 @@ func TestSaveInboundIfAbsent(t *testing.T) {
 	require.False(t, insertedAgain)
 	require.JSONEq(t, string(original.Payload), string(duplicateStored.Payload))
 	require.Equal(t, "first", duplicateStored.Metadata["source"])
+}
+
+func TestSaveInboundSkipsAlreadyAppliedSweptFrame(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	inbound := reliablemq.Frame{
+		Key:     reliablemq.FrameKey{QueueID: "conn_1", Stream: reliablemq.StreamACP, Seq: 1, Direction: reliablemq.DirectionInbound},
+		Kind:    reliablemq.FrameKindData,
+		Payload: []byte(`{"first":true}`),
+	}
+	inserted, stored, err := store.SaveInboundIfAbsent(ctx, inbound)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.NoError(t, store.MarkApplied(ctx, stored.Key))
+	_, err = db.Exec(`DELETE FROM reliablemq_frames WHERE queue_id = ? AND stream = ? AND seq = ? AND direction = ?`,
+		"conn_1", string(reliablemq.StreamACP), int64(1), string(reliablemq.DirectionInbound))
+	require.NoError(t, err)
+
+	// When
+	insertedAgain, duplicateStored, err := store.SaveInboundIfAbsent(ctx, inbound)
+
+	// Then
+	require.NoError(t, err)
+	require.False(t, insertedAgain)
+	require.Equal(t, inbound.Key, duplicateStored.Key)
+	require.Equal(t, reliablemq.StatusApplied, duplicateStored.Status)
 }
 
 func TestAckOutboundThrough(t *testing.T) {
