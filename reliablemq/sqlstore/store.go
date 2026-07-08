@@ -300,6 +300,176 @@ func (s *Store) ListInboundReplay(
 	})
 }
 
+func (s *Store) LoadQueueState(
+	ctx context.Context,
+	queueID string,
+	stream reliablemq.Stream,
+) (reliablemq.QueueState, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return reliablemq.QueueState{}, err
+	}
+	defer rollback(tx)
+	if err := s.ensureQueueStateTx(ctx, tx, queueID, stream); err != nil {
+		return reliablemq.QueueState{}, err
+	}
+	b := s.dialect.bind
+	var state reliablemq.QueueState
+	err = tx.QueryRowContext(ctx, `
+		SELECT next_outbound_seq, inbound_applied_through
+		FROM `+s.queueStateTableName+`
+		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+`
+	`, queueID, string(stream)).Scan(&state.NextOutboundSeq, &state.InboundAppliedThrough)
+	if err != nil {
+		return reliablemq.QueueState{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return reliablemq.QueueState{}, err
+	}
+	return state, nil
+}
+
+func (s *Store) LoadProducerReconcileCheckpoint(
+	ctx context.Context,
+	queueID string,
+	stream reliablemq.Stream,
+) (reliablemq.ProducerReconcileCheckpoint, error) {
+	state, err := s.LoadQueueState(ctx, queueID, stream)
+	if err != nil {
+		return reliablemq.ProducerReconcileCheckpoint{}, err
+	}
+	frames, err := s.ListOutboundReplay(ctx, queueID, stream, 1_000_000)
+	if err != nil {
+		return reliablemq.ProducerReconcileCheckpoint{}, err
+	}
+	var replayFrom int64
+	var replayThrough int64
+	for _, frame := range frames {
+		if replayFrom == 0 || frame.Key.Seq < replayFrom {
+			replayFrom = frame.Key.Seq
+		}
+		if frame.Key.Seq > replayThrough {
+			replayThrough = frame.Key.Seq
+		}
+	}
+	return reliablemq.ProducerReconcileCheckpoint{
+		QueueID:         queueID,
+		Stream:          stream,
+		ProducerNextSeq: state.NextOutboundSeq,
+		ReplayFrom:      replayFrom,
+		ReplayThrough:   replayThrough,
+	}, nil
+}
+
+func (s *Store) AdvanceProducerNextSeq(
+	ctx context.Context,
+	queueID string,
+	stream reliablemq.Stream,
+	nextSeq int64,
+) error {
+	if nextSeq <= 0 {
+		return fmt.Errorf("%w: next seq must be positive", reliablemq.ErrInvalidFrame)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	if err := s.updateNextOutboundSeqAtLeastTx(ctx, tx, queueID, stream, nextSeq); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ConsumerAckedThrough(
+	ctx context.Context,
+	queueID string,
+	stream reliablemq.Stream,
+) (int64, error) {
+	b := s.dialect.bind
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT seq
+		FROM `+s.tableName+`
+		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+`
+			AND direction = `+b(3)+`
+			AND status IN (`+b(4)+`, `+b(5)+`, `+b(6)+`)
+		ORDER BY seq ASC
+	`, queueID, string(stream), string(reliablemq.DirectionInbound),
+		string(reliablemq.StatusReceived), string(reliablemq.StatusApplied), string(reliablemq.StatusRejected))
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var through int64
+	next := int64(1)
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return 0, err
+		}
+		if seq < next {
+			continue
+		}
+		if seq != next {
+			break
+		}
+		through = seq
+		next++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return through, nil
+}
+
+func (s *Store) ApplyBatch(ctx context.Context, batch reliablemq.StoreBatch) error {
+	if len(batch.Frames) == 0 && len(batch.Patches) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	for _, frame := range batch.Frames {
+		if err := reliablemq.ValidateFrame(frame); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		frame = frame.Clone()
+		if frame.CreatedAt.IsZero() {
+			frame.CreatedAt = now
+		}
+		if frame.UpdatedAt.IsZero() {
+			frame.UpdatedAt = frame.CreatedAt
+		}
+		if frame.Key.Direction == reliablemq.DirectionOutbound {
+			if err := s.updateNextOutboundSeqAtLeastTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream, frame.Key.Seq+1); err != nil {
+				return err
+			}
+		} else if err := s.ensureQueueStateTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream); err != nil {
+			return err
+		}
+		if _, err := s.insertFrame(ctx, tx, frame); err != nil {
+			return err
+		}
+		if err := s.applyFrameStateTx(ctx, tx, frame); err != nil {
+			return err
+		}
+		if frame.Key.Direction == reliablemq.DirectionInbound && frame.Status == reliablemq.StatusApplied {
+			if err := s.updateInboundAppliedThroughTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream, frame.Key.Seq); err != nil {
+				return err
+			}
+		}
+	}
+	for _, patch := range batch.Patches {
+		if err := s.applyPatchTx(ctx, tx, patch); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) MarkSent(ctx context.Context, key reliablemq.FrameKey) error {
 	return s.updateStatus(ctx, key, reliablemq.StatusSent, "")
 }
@@ -310,15 +480,15 @@ func (s *Store) AckOutboundThrough(
 	stream reliablemq.Stream,
 	throughSeq int64,
 ) error {
-	now := formatTime(time.Now().UTC())
-	b := s.dialect.bind
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE `+s.tableName+`
-		SET status = `+b(1)+`, error_message = '', updated_at = `+b(2)+`
-		WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
-			AND direction = `+b(5)+` AND seq <= `+b(6)+`
-	`, string(reliablemq.StatusAcked), now, queueID, string(stream), string(reliablemq.DirectionOutbound), throughSeq)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	if err := s.ackOutboundThroughTx(ctx, tx, queueID, stream, throughSeq); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) MarkApplied(ctx context.Context, key reliablemq.FrameKey) error {
@@ -701,6 +871,29 @@ func (s *Store) allocateOutboundSeqTx(
 	return seq, nil
 }
 
+func (s *Store) updateNextOutboundSeqAtLeastTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueID string,
+	stream reliablemq.Stream,
+	nextSeq int64,
+) error {
+	if err := s.ensureQueueStateTx(ctx, tx, queueID, stream); err != nil {
+		return err
+	}
+	b := s.dialect.bind
+	_, err := tx.ExecContext(ctx, `
+		UPDATE `+s.queueStateTableName+`
+		SET next_outbound_seq = CASE
+				WHEN next_outbound_seq < `+b(1)+` THEN `+b(2)+`
+				ELSE next_outbound_seq
+			END,
+			updated_at = `+b(3)+`
+		WHERE queue_id = `+b(4)+` AND stream = `+b(5)+`
+	`, nextSeq, nextSeq, formatTime(time.Now().UTC()), queueID, string(stream))
+	return err
+}
+
 func (s *Store) ensureQueueStateTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -876,9 +1069,136 @@ func (s *Store) updateStatusTx(
 	return requireAffected(result)
 }
 
-func (s *Store) updateError(ctx context.Context, key reliablemq.FrameKey, errorMessage string) error {
+func (s *Store) applyPatchTx(ctx context.Context, tx *sql.Tx, patch reliablemq.StorePatch) error {
+	if patch.HasMetadata {
+		metadata, err := marshalMetadata(patch.Metadata)
+		if err != nil {
+			return err
+		}
+		b := s.dialect.bind
+		result, err := tx.ExecContext(ctx, `
+			UPDATE `+s.tableName+`
+			SET metadata_json = `+b(1)+`, updated_at = `+b(2)+`
+			WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
+				AND seq = `+b(5)+` AND direction = `+b(6)+`
+		`, string(metadata), formatTime(time.Now().UTC()), patch.Key.QueueID,
+			string(patch.Key.Stream), patch.Key.Seq, string(patch.Key.Direction))
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(result); err != nil {
+			return err
+		}
+	}
+	switch patch.Status {
+	case "":
+	case reliablemq.StatusSent:
+		if err := s.updateStatusTx(ctx, tx, patch.Key, reliablemq.StatusSent, ""); err != nil {
+			return err
+		}
+	case reliablemq.StatusAcked:
+		if err := s.ackOutboundThroughTx(ctx, tx, patch.Key.QueueID, patch.Key.Stream, patch.Key.Seq); err != nil {
+			return err
+		}
+	case reliablemq.StatusApplied:
+		if err := s.updateStatusTx(ctx, tx, patch.Key, reliablemq.StatusApplied, ""); err != nil {
+			return err
+		}
+		if patch.Key.Direction == reliablemq.DirectionInbound {
+			if err := s.updateInboundAppliedThroughTx(ctx, tx, patch.Key.QueueID, patch.Key.Stream, patch.Key.Seq); err != nil {
+				return err
+			}
+		}
+	case reliablemq.StatusRejected:
+		if err := s.updateStatusTx(ctx, tx, patch.Key, reliablemq.StatusRejected, patch.ErrorMessage); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: invalid status %q", reliablemq.ErrInvalidFrame, patch.Status)
+	}
+	if patch.ErrorMessage != "" && patch.Status != reliablemq.StatusRejected {
+		return s.updateErrorTx(ctx, tx, patch.Key, patch.ErrorMessage)
+	}
+	return nil
+}
+
+func (s *Store) applyFrameStateTx(ctx context.Context, tx *sql.Tx, frame reliablemq.Frame) error {
+	if len(frame.Metadata) > 0 {
+		metadata, err := marshalMetadata(frame.Metadata)
+		if err != nil {
+			return err
+		}
+		b := s.dialect.bind
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE `+s.tableName+`
+			SET metadata_json = `+b(1)+`, updated_at = `+b(2)+`
+			WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
+				AND seq = `+b(5)+` AND direction = `+b(6)+`
+		`, string(metadata), formatTime(time.Now().UTC()), frame.Key.QueueID,
+			string(frame.Key.Stream), frame.Key.Seq, string(frame.Key.Direction)); err != nil {
+			return err
+		}
+	}
+	switch frame.Status {
+	case reliablemq.StatusPending, reliablemq.StatusReceived:
+	case reliablemq.StatusSent:
+		if err := s.updateStatusTx(ctx, tx, frame.Key, reliablemq.StatusSent, ""); err != nil {
+			return err
+		}
+	case reliablemq.StatusAcked:
+		if err := s.ackOutboundThroughTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream, frame.Key.Seq); err != nil {
+			return err
+		}
+	case reliablemq.StatusApplied:
+		if err := s.updateStatusTx(ctx, tx, frame.Key, reliablemq.StatusApplied, ""); err != nil {
+			return err
+		}
+	case reliablemq.StatusRejected:
+		if err := s.updateStatusTx(ctx, tx, frame.Key, reliablemq.StatusRejected, frame.ErrorMessage); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: invalid status %q", reliablemq.ErrInvalidFrame, frame.Status)
+	}
+	if frame.ErrorMessage != "" && frame.Status != reliablemq.StatusRejected {
+		return s.updateErrorTx(ctx, tx, frame.Key, frame.ErrorMessage)
+	}
+	return nil
+}
+
+func (s *Store) ackOutboundThroughTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueID string,
+	stream reliablemq.Stream,
+	throughSeq int64,
+) error {
+	now := formatTime(time.Now().UTC())
 	b := s.dialect.bind
-	result, err := s.db.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
+		UPDATE `+s.tableName+`
+		SET status = `+b(1)+`, error_message = '', updated_at = `+b(2)+`
+		WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
+			AND direction = `+b(5)+` AND seq <= `+b(6)+`
+	`, string(reliablemq.StatusAcked), now, queueID, string(stream), string(reliablemq.DirectionOutbound), throughSeq)
+	return err
+}
+
+func (s *Store) updateError(ctx context.Context, key reliablemq.FrameKey, errorMessage string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	if err := s.updateErrorTx(ctx, tx, key, errorMessage); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) updateErrorTx(ctx context.Context, tx *sql.Tx, key reliablemq.FrameKey, errorMessage string) error {
+	b := s.dialect.bind
+	result, err := tx.ExecContext(ctx, `
 		UPDATE `+s.tableName+`
 		SET error_message = `+b(1)+`, updated_at = `+b(2)+`
 		WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
