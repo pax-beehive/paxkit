@@ -43,3 +43,50 @@ type DurableStore interface {
 	RecordDispatchFailure(ctx context.Context, key FrameKey, errorMessage string) error
 	UpdateMetadata(ctx context.Context, key FrameKey, metadata Metadata) error
 }
+
+type QueueState struct {
+	NextOutboundSeq       int64
+	InboundAppliedThrough int64
+}
+
+// QueueStateStore is an optional companion interface for stores that expose
+// transport queue cursors without mutating journal rows.
+type QueueStateStore interface {
+	LoadQueueState(ctx context.Context, queueID string, stream Stream) (QueueState, error)
+}
+
+type StoreBatch struct {
+	Frames  []Frame
+	Patches []StorePatch
+}
+
+type StorePatch struct {
+	Key          FrameKey
+	Status       Status
+	ErrorMessage string
+	Metadata     Metadata
+	HasMetadata  bool
+}
+
+// BatchStore is an optional fast path for DurableStore implementations that can
+// apply one write-behind flush in a single transaction.
+type BatchStore interface {
+	ApplyBatch(ctx context.Context, batch StoreBatch) error
+}
+
+type ProducerReconcileCheckpoint struct {
+	QueueID         string
+	Stream          Stream
+	ProducerNextSeq int64
+	ReplayFrom      int64
+	ReplayThrough   int64
+}
+
+type ReconcileProducerStore interface {
+	LoadProducerReconcileCheckpoint(ctx context.Context, queueID string, stream Stream) (ProducerReconcileCheckpoint, error)
+	AdvanceProducerNextSeq(ctx context.Context, queueID string, stream Stream, nextSeq int64) error
+}
+
+type ReconcileConsumerStore interface {
+	ConsumerAckedThrough(ctx context.Context, queueID string, stream Stream) (int64, error)
+}

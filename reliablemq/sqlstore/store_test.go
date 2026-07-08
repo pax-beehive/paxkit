@@ -377,6 +377,74 @@ func TestStatusTransitions(t *testing.T) {
 	require.Equal(t, "denied", mustGet(t, store, inboundRejected.Key).ErrorMessage)
 }
 
+func TestApplyBatchUpdatesExistingFrameFinalStatus(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	frame, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{"n":1}`), reliablemq.Metadata{"agent_id": "agent_1"})
+	require.NoError(t, err)
+	sent := frame.Clone()
+	sent.Status = reliablemq.StatusSent
+	sent.Metadata = reliablemq.Metadata{"agent_id": "agent_1", "phase": "sent"}
+
+	// When
+	err = store.ApplyBatch(ctx, reliablemq.StoreBatch{Frames: []reliablemq.Frame{sent}})
+
+	// Then
+	require.NoError(t, err)
+	got := mustGet(t, store, frame.Key)
+	require.Equal(t, reliablemq.StatusSent, got.Status)
+	require.Equal(t, "sent", got.Metadata["phase"])
+}
+
+func TestApplyBatchAdvancesOutboundSeqCursor(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	frame := reliablemq.Frame{
+		Key:     reliablemq.FrameKey{QueueID: "conn_1", Stream: reliablemq.StreamACP, Seq: 7, Direction: reliablemq.DirectionOutbound},
+		Kind:    reliablemq.FrameKindData,
+		Payload: []byte(`{"n":7}`),
+		Status:  reliablemq.StatusSent,
+	}
+
+	// When
+	require.NoError(t, store.ApplyBatch(ctx, reliablemq.StoreBatch{Frames: []reliablemq.Frame{frame}}))
+	next, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{"n":8}`), nil)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(8), next.Key.Seq)
+}
+
+func TestApplyBatchRollsBackWhenPatchFails(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	inserted := reliablemq.Frame{
+		Key:     reliablemq.FrameKey{QueueID: "conn_1", Stream: reliablemq.StreamACP, Seq: 1, Direction: reliablemq.DirectionOutbound},
+		Kind:    reliablemq.FrameKindData,
+		Payload: []byte(`{"n":1}`),
+		Status:  reliablemq.StatusPending,
+	}
+	missingPatch := reliablemq.StorePatch{
+		Key:    reliablemq.FrameKey{QueueID: "conn_1", Stream: reliablemq.StreamACP, Seq: 99, Direction: reliablemq.DirectionOutbound},
+		Status: reliablemq.StatusSent,
+	}
+
+	// When
+	err := store.ApplyBatch(ctx, reliablemq.StoreBatch{
+		Frames:  []reliablemq.Frame{inserted},
+		Patches: []reliablemq.StorePatch{missingPatch},
+	})
+
+	// Then
+	require.Error(t, err)
+	_, ok, err := store.Get(ctx, inserted.Key)
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
 func TestUpdateMetadata(t *testing.T) {
 	// Given
 	store := newTestStore(t)

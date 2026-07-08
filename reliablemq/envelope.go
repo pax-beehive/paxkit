@@ -8,19 +8,38 @@ import (
 type EnvelopeType string
 
 const (
-	EnvelopeTypeData      EnvelopeType = "data"
-	EnvelopeTypeAck       EnvelopeType = "ack"
-	EnvelopeTypeTombstone EnvelopeType = "tombstone"
+	EnvelopeTypeData              EnvelopeType = "data"
+	EnvelopeTypeAck               EnvelopeType = "ack"
+	EnvelopeTypeTombstone         EnvelopeType = "tombstone"
+	EnvelopeTypeReconcileRequest  EnvelopeType = "reconcile_request"
+	EnvelopeTypeReconcileResponse EnvelopeType = "reconcile_response"
+)
+
+type ReconcileAction string
+
+const (
+	ReconcileActionAligned         ReconcileAction = "aligned"
+	ReconcileActionReplay          ReconcileAction = "replay"
+	ReconcileActionAdvanceProducer ReconcileAction = "advance_producer"
+	ReconcileActionRotate          ReconcileAction = "rotate"
 )
 
 type Envelope struct {
-	Type         EnvelopeType    `json:"type"`
-	QueueID      string          `json:"queue_id"`
-	Stream       Stream          `json:"stream"`
-	Seq          int64           `json:"seq"`
-	Metadata     Metadata        `json:"metadata,omitempty"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
-	ErrorMessage string          `json:"error_message,omitempty"`
+	Type                   EnvelopeType    `json:"type"`
+	QueueID                string          `json:"queue_id"`
+	Stream                 Stream          `json:"stream"`
+	Seq                    int64           `json:"seq,omitempty"`
+	Metadata               Metadata        `json:"metadata,omitempty"`
+	Payload                json.RawMessage `json:"payload,omitempty"`
+	ErrorMessage           string          `json:"error_message,omitempty"`
+	ProducerNextSeq        int64           `json:"producer_next_seq,omitempty"`
+	ReplayFrom             int64           `json:"replay_from,omitempty"`
+	ReplayThrough          int64           `json:"replay_through,omitempty"`
+	ConsumerAckedThrough   int64           `json:"consumer_acked_through,omitempty"`
+	Action                 ReconcileAction `json:"action,omitempty"`
+	From                   int64           `json:"from,omitempty"`
+	Through                int64           `json:"through,omitempty"`
+	AdvanceProducerNextSeq int64           `json:"advance_producer_next_seq,omitempty"`
 }
 
 func DataEnvelope(frame Frame) Envelope {
@@ -61,6 +80,17 @@ func AckEnvelope(queueID string, stream Stream, throughSeq int64) Envelope {
 	}
 }
 
+func ReconcileRequestEnvelope(checkpoint ProducerReconcileCheckpoint) Envelope {
+	return Envelope{
+		Type:            EnvelopeTypeReconcileRequest,
+		QueueID:         checkpoint.QueueID,
+		Stream:          checkpoint.Stream,
+		ProducerNextSeq: checkpoint.ProducerNextSeq,
+		ReplayFrom:      checkpoint.ReplayFrom,
+		ReplayThrough:   checkpoint.ReplayThrough,
+	}
+}
+
 func MarshalEnvelope(env Envelope) ([]byte, error) {
 	if err := ValidateEnvelope(env); err != nil {
 		return nil, err
@@ -80,7 +110,11 @@ func UnmarshalEnvelope(data []byte) (Envelope, error) {
 }
 
 func ValidateEnvelope(env Envelope) error {
-	if env.Type != EnvelopeTypeData && env.Type != EnvelopeTypeAck && env.Type != EnvelopeTypeTombstone {
+	if env.Type != EnvelopeTypeData &&
+		env.Type != EnvelopeTypeAck &&
+		env.Type != EnvelopeTypeTombstone &&
+		env.Type != EnvelopeTypeReconcileRequest &&
+		env.Type != EnvelopeTypeReconcileResponse {
 		return fmt.Errorf("%w: unknown type %q", ErrInvalidEnvelope, env.Type)
 	}
 	if env.QueueID == "" {
@@ -89,7 +123,7 @@ func ValidateEnvelope(env Envelope) error {
 	if env.Stream == "" {
 		return fmt.Errorf("%w: stream is required", ErrInvalidEnvelope)
 	}
-	if env.Seq <= 0 {
+	if (env.Type == EnvelopeTypeData || env.Type == EnvelopeTypeAck || env.Type == EnvelopeTypeTombstone) && env.Seq <= 0 {
 		return fmt.Errorf("%w: seq must be positive", ErrInvalidEnvelope)
 	}
 	if env.Type == EnvelopeTypeData {
@@ -102,6 +136,35 @@ func ValidateEnvelope(env Envelope) error {
 	}
 	if env.Type == EnvelopeTypeTombstone && len(env.Payload) > 0 {
 		return fmt.Errorf("%w: tombstone must not carry payload", ErrInvalidEnvelope)
+	}
+	if env.Type == EnvelopeTypeReconcileRequest {
+		if env.ProducerNextSeq <= 0 {
+			return fmt.Errorf("%w: producer_next_seq must be positive", ErrInvalidEnvelope)
+		}
+		if env.ReplayFrom < 0 || env.ReplayThrough < 0 {
+			return fmt.Errorf("%w: replay range must be non-negative", ErrInvalidEnvelope)
+		}
+		if env.ReplayFrom > 0 && env.ReplayThrough < env.ReplayFrom {
+			return fmt.Errorf("%w: replay_through must be >= replay_from", ErrInvalidEnvelope)
+		}
+	}
+	if env.Type == EnvelopeTypeReconcileResponse {
+		switch env.Action {
+		case ReconcileActionAligned, ReconcileActionReplay, ReconcileActionAdvanceProducer, ReconcileActionRotate:
+		default:
+			return fmt.Errorf("%w: invalid reconcile action %q", ErrInvalidEnvelope, env.Action)
+		}
+		if env.ConsumerAckedThrough < 0 {
+			return fmt.Errorf("%w: consumer_acked_through must be non-negative", ErrInvalidEnvelope)
+		}
+		if env.Action == ReconcileActionReplay {
+			if env.From <= 0 || env.Through < env.From {
+				return fmt.Errorf("%w: invalid replay range", ErrInvalidEnvelope)
+			}
+		}
+		if env.Action == ReconcileActionAdvanceProducer && env.AdvanceProducerNextSeq <= 0 {
+			return fmt.Errorf("%w: advance_producer_next_seq must be positive", ErrInvalidEnvelope)
+		}
 	}
 	return nil
 }
