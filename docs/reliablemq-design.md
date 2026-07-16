@@ -13,7 +13,11 @@ any concrete database, ORM, or WebSocket library.
 - Ordered delivery per `queue_id + stream`.
 - Deduplication by `queue_id + stream + seq + direction`.
 - Monotonic `seq` within `queue_id + stream + direction`.
-- Outbound payloads must be durably persisted before network send.
+- `Send` is non-blocking local acceptance into a process-owned producer.
+- Journal flush and network send advance independently; a healthy network may
+  send an accepted frame before its journal batch is durable.
+- An accepted but unflushed tail can be lost on process crash. This explicit
+  send-first crash window is not an exactly-once guarantee.
 - ACK is cumulative through `seq`.
 - ACK only means the peer durably recorded the frame. It does not mean business
   processing completed.
@@ -211,7 +215,11 @@ The store must atomically:
 2. Insert the frame durably with `direction=outbound` and `status=pending`.
 3. Return the complete frame.
 
-This method is the core persist-before-send guarantee.
+When called on a concrete durable sink, the allocation and insert remain one
+atomic store operation. `ProducerWriteBehindStore` implements the same API as a
+hot journal: it allocates from bootstrapped queue state, returns immediately,
+and flushes the frame to its durable sink asynchronously. Therefore a successful
+call through that wrapper is not itself a durability boundary.
 
 ### AppendOutboundTombstone
 
@@ -225,8 +233,10 @@ The store must atomically:
    `status=pending`, `error_message`, and metadata.
 3. Return the complete frame.
 
-Tombstones are sent over the wire, replayed, and ACKed like data frames, but
-they are never dispatched to business logic.
+The concrete durable sink still allocates and inserts a tombstone atomically.
+`ProducerWriteBehindStore` may stage that operation in memory exactly as it does
+for data. Tombstones are sent over the wire, replayed, and ACKed like data
+frames, but they are never dispatched to business logic.
 
 ### SaveInboundIfAbsent
 
@@ -256,9 +266,12 @@ Typical status: `received`.
 
 ### MarkSent
 
-Called after a network write succeeds. This changes an outbound frame to `sent`.
+Retained for store compatibility with older callers and journal rows. The
+producer-owned network cursor does not call `MarkSent` after each socket write;
+network success advances its in-memory `nextToSend` cursor instead.
 
-`sent` does not mean the peer received or persisted the frame.
+`pending` and legacy `sent` rows are both replayable until a cumulative ACK
+covers them. `sent` does not mean the peer received or persisted the frame.
 
 ### AckOutboundThrough
 
@@ -281,10 +294,11 @@ later sequence numbers.
 
 ### RecordSendFailure
 
-Called when a network send attempt fails. This records error details and may
-leave the frame in its existing replayable status. This is transport recovery,
-not application retry: a frame already accepted into the reliable stream remains
-eligible for reconnect replay until ACKed.
+Retained for compatibility with older direct-send callers. The producer records
+a socket failure in connection telemetry, disables that binding generation, and
+leaves `nextToSend` at the failed head. It does not synchronously patch the
+durable row for every failed attempt. This is transport recovery, not
+application retry: a frame remains eligible for reconnect replay until ACKed.
 
 ### RecordDispatchFailure
 
@@ -299,7 +313,9 @@ keeps hook-injected trace/auth/context metadata durable for replay.
 
 ## Runtime Interfaces
 
-`Sender` is the network boundary. It sends wire envelopes.
+`Sender` is the network boundary bound to a producer connection generation. A
+producer-owned writer goroutine is its only caller and serializes both data and
+ACK envelopes.
 
 ```go
 type Sender interface {
@@ -319,6 +335,9 @@ The split is intentional:
 
 - `Envelope` is wire-level and includes both data and ACK messages.
 - `Frame` is local durable state and is only dispatched for non-duplicate data.
+- A WebSocket read loop calls `Engine.Receive`; it never writes an ACK directly.
+- A reconnect path binds its `Sender` to the existing process-owned producer; it
+  does not start a second replay writer.
 
 ## Hooks
 
@@ -379,8 +398,8 @@ type Config struct {
 Hook boundaries:
 
 - `BeforeSend`: outbound payload is ready to enter the reliable stream, but no
-  sequence number has been allocated yet. The hook returns a decision: continue
-  as data, append/send a tombstone, or fail without entering the stream.
+  sequence number has been allocated yet. The hook returns a decision: accept
+  data, accept a tombstone, or fail without entering the stream.
 - `BeforeDispatch`: inbound payload has already been durably recorded, but has
   not been handed to local business logic.
 
@@ -390,6 +409,8 @@ handler, so it can run logic before and/or after downstream middleware. A
 middleware may short-circuit by returning a decision without calling `next`.
 
 Hooks may read and update metadata. v1 hooks should treat payload as read-only.
+Outbound hooks run inside the acceptance call, so they must be bounded, local,
+and free of network or database I/O.
 
 Decision and error have different meanings:
 
@@ -398,13 +419,10 @@ Decision and error have different meanings:
   dependency is unavailable.
 
 The first implementation uses `OutboundHookErrorTombstone`: an outbound hook
-runtime error is converted into a durable tombstone frame whose `error_message`
-is `err.Error()`. This keeps the peer-visible sequence log explicit. The config
-keeps room for future policies, but the first version does not implement local
-preflight retry.
-
-An outbound tombstone decision means a tombstone frame is durably appended,
-sent, replayed, and ACKed.
+runtime error is converted into an accepted tombstone entry whose
+`error_message` is `err.Error()`. The producer later sequences, flushes, sends,
+replays, and receives an ACK for that tombstone. The config keeps room for future
+policies, but the first version does not implement local preflight retry.
 
 An inbound hook runtime error is a delivery failure, not a rejection. It records
 `error_message` and leaves the frame `received` so `ReplayInbound` can try again.
@@ -420,7 +438,7 @@ other host process.
 ```go
 type Engine struct {
     Store      DurableStore
-    Sender     Sender
+    Producer   *Producer
     Dispatcher Dispatcher
 
     // internal:
@@ -432,12 +450,39 @@ type Engine struct {
 Public methods:
 
 ```go
-func NewEngine(config Config, store DurableStore, sender Sender, dispatcher Dispatcher, opts ...Option) *Engine
-func (e *Engine) Send(ctx context.Context, msg OutboundMessage) (Frame, error)
+func NewEngine(config Config, store DurableStore, producer *Producer, dispatcher Dispatcher, opts ...Option) *Engine
+func (e *Engine) Send(ctx context.Context, msg OutboundMessage) error
 func (e *Engine) Receive(ctx context.Context, env Envelope) error
-func (e *Engine) ReplayOutbound(ctx context.Context, queueID string, stream Stream, limit int) error
 func (e *Engine) ReplayInbound(ctx context.Context, queueID string, stream Stream, limit int) error
 ```
+
+### Producer lifecycle
+
+A `Producer` belongs to the host process and one `queue_id + stream`, not to a
+WebSocket attempt. `NewProducer` bootstraps sequence and checkpoint state before
+it becomes ready. `ProducerRegistry` owns and reuses one producer for each
+partition and closes producers before the store during process shutdown.
+
+Accepted entries are copied into a non-blocking MPSC ingress. One owner
+goroutine assigns contiguous sequence numbers and owns mutable cursor state:
+
+```text
+tail             largest accepted and sequenced frame
+persistedThrough largest contiguous frame flushed to the journal sink
+nextToSend       next data frame for the current connection generation
+ackedThrough     largest cumulative peer durable-receive ACK
+```
+
+The journal flusher and network cursor advance independently. Persisted frames
+may leave the hot log and be loaded from the journal on reconnect. Unpersisted
+frames stay hot; configured age and byte limits make prolonged journal failure
+an explicit producer failure instead of hidden blocking or silent loss.
+
+After reconciliation, `Bind(ctx, sender, peerAckedThrough)` replaces the network
+generation and resumes at `ackedThrough + 1`. Its binding owns the only writer.
+`WaitCaughtUp` is the recovery-ready barrier for the tail that existed at bind
+time. Closing an old binding is generation-checked and cannot detach a newer
+connection.
 
 ### Send
 
@@ -445,18 +490,16 @@ Used when local code produces an outbound payload.
 
 Flow:
 
-1. `BeforeSend`
-2. If decision is data: `AppendOutboundData`
-3. If decision is tombstone: `AppendOutboundTombstone`
-4. `Sender.Send(data or tombstone envelope)`
-5. `MarkSent`
+1. Validate the message and its producer partition.
+2. Clone owned payload/metadata and run `BeforeSend`.
+3. Convert the decision to a data or tombstone ingress entry.
+4. Atomically append the entry to producer ingress and signal the owner.
 
 If `BeforeSend` returns a runtime error, the first implementation follows
-`OutboundHookErrorTombstone`: append and send a tombstone with
-`error_message=err.Error()`. If the hook decides tombstone, the engine also
-appends and sends a tombstone frame. Tombstones consume the next seq, preserve
-the shared stream log, and give both sides a durable debug record for the skipped
-payload.
+`OutboundHookErrorTombstone` and accepts a tombstone with
+`error_message=err.Error()`. `Send` returns only an acceptance error and never a
+`Frame`; sequence assignment, journal flush, socket write, and ACK happen after
+the call returns. Caller cancellation no longer owns an entry after acceptance.
 
 ### Receive
 
@@ -465,7 +508,8 @@ Used by the WebSocket read loop after decoding an envelope.
 ACK flow:
 
 1. Validate ACK envelope.
-2. `AckOutboundThrough`.
+2. Submit its cumulative `through` value to the producer owner.
+3. Advance and asynchronously persist `ackedThrough`.
 
 Invalid envelope type, invalid seq, or invalid payload is a protocol error:
 `Receive` returns an error. The frame is not stored and no ACK is sent. Callers
@@ -475,7 +519,8 @@ Data flow:
 
 1. Validate data envelope.
 2. `SaveInboundIfAbsent`.
-3. Send ACK after durable record succeeds.
+3. Submit a cumulative ACK after durable record succeeds; the producer's single
+   writer coalesces and sends it.
 4. If duplicate, stop.
 5. `BeforeDispatch`.
 6. If decision is reject: `UpdateMetadata`, `MarkRejected`, stop.
@@ -496,13 +541,16 @@ Tombstone flow:
 
 1. Validate tombstone envelope.
 2. `SaveInboundIfAbsent`.
-3. Send ACK after durable record succeeds.
+3. Submit a cumulative ACK after durable record succeeds.
 4. Mark `applied` locally without dispatching to business logic.
 
-### ReplayOutbound
+### Outbound reconnect
 
-Used after reconnect. Lists outbound replay frames and resends them in `seq`
-order.
+There is no engine-owned `ReplayOutbound` loop. Reconciliation advances producer
+checkpoint state, then `Producer.Bind` enables the same cursor used for backlog
+and live output. It pages until it reaches the exact tail, so a configured list
+limit is a batch size rather than a replay cap. A head write failure disables the
+binding and leaves later frames behind that head.
 
 ### ReplayInbound
 
@@ -512,7 +560,9 @@ dispatches them in `seq` order.
 ## Typical paxd Usage
 
 ```go
-engine := reliablemq.NewEngine(storeAdapter, wsSender, acpStdinDispatcher, hooks...)
+registry, err := reliablemq.NewProducerRegistry(writeBehindStore, reliablemq.ProducerConfig{})
+producer, err := registry.Get(ctx, connectionID, reliablemq.StreamACP)
+engine := reliablemq.NewEngine(reliablemq.Config{}, writeBehindStore, producer, acpRouter, hooks...)
 
 // WebSocket read loop.
 env, err := reliablemq.UnmarshalEnvelope(raw)
@@ -520,18 +570,28 @@ if err == nil {
     err = engine.Receive(ctx, env)
 }
 
-// ACP stdout loop.
-_, err = engine.Send(ctx, connectionID, reliablemq.StreamACP, payload, metadata)
+// ACP stdout enters the process-owned producer even while disconnected.
+err = engine.Send(ctx, reliablemq.OutboundMessage{
+    QueueID: connectionID,
+    Stream: reliablemq.StreamACP,
+    Payload: payload,
+    Metadata: metadata,
+})
 
-// Reconnect.
-_ = engine.ReplayOutbound(ctx, connectionID, reliablemq.StreamACP, 1000)
+// Reconnect after producer/consumer checkpoint reconciliation.
+binding, err := producer.Bind(ctx, wsSender, peerAckedThrough)
+if err == nil {
+    err = binding.WaitCaughtUp(ctx)
+}
 _ = engine.ReplayInbound(ctx, connectionID, reliablemq.StreamACP, 1000)
 ```
 
 ## Typical pax-manager Usage
 
 ```go
-engine := reliablemq.NewEngine(storeAdapter, wsSender, localPipelineDispatcher, hooks...)
+registry, err := reliablemq.NewProducerRegistry(writeBehindStore, reliablemq.ProducerConfig{})
+producer, err := registry.Get(ctx, connectionID, reliablemq.StreamACP)
+engine := reliablemq.NewEngine(reliablemq.Config{}, writeBehindStore, producer, localPipelineDispatcher, hooks...)
 
 // paxd WebSocket read loop.
 env, err := reliablemq.UnmarshalEnvelope(raw)
@@ -540,7 +600,18 @@ if err == nil {
 }
 
 // user/API/manager-produced payload.
-_, err = engine.Send(ctx, connectionID, reliablemq.StreamACP, payload, metadata)
+err = engine.Send(ctx, reliablemq.OutboundMessage{
+    QueueID: connectionID,
+    Stream: reliablemq.StreamACP,
+    Payload: payload,
+    Metadata: metadata,
+})
+
+// Make the tunnel claimable only after its recovery barrier.
+binding, err := producer.Bind(ctx, wsSender, peerAckedThrough)
+if err == nil {
+    err = binding.WaitCaughtUp(ctx)
+}
 ```
 
 ## Open Design Questions

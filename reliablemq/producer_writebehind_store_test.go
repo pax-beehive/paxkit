@@ -58,6 +58,18 @@ func TestProducerWriteBehindStoreKeepsInboundConsumerOperationsSynchronous(t *te
 	assert.Equal(t, []string{"SaveInboundIfAbsent:1", "MarkApplied:1"}, sink.calls)
 }
 
+func TestProducerWriteBehindStorePassesConsumerCheckpointThrough(t *testing.T) {
+	sink := newProducerWriteBehindSink()
+	sink.consumerAckedThrough = 54
+	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
+	defer closeProducerWriteBehindStore(t, store)
+
+	through, err := store.ConsumerAckedThrough(context.Background(), "queue_1", StreamACP)
+	require.NoError(t, err)
+	assert.Equal(t, int64(54), through)
+	assert.Equal(t, []string{"ConsumerAckedThrough:queue_1:acp"}, sink.calls)
+}
+
 func TestProducerWriteBehindStoreBatchesAckThrough(t *testing.T) {
 	sink := newProducerWriteBehindSink()
 	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
@@ -300,17 +312,20 @@ func closeProducerWriteBehindStore(t *testing.T, store *ProducerWriteBehindStore
 }
 
 type producerWriteBehindSinkWithoutBatch struct {
-	mu             sync.Mutex
-	calls          []string
-	next           int64
-	queueState     QueueState
-	outboundReplay []Frame
+	mu                   sync.Mutex
+	calls                []string
+	next                 int64
+	queueState           QueueState
+	consumerAckedThrough int64
+	inboundFrames        map[FrameKey]Frame
+	outboundReplay       []Frame
 }
 
 func newProducerWriteBehindSinkWithoutBatch() *producerWriteBehindSinkWithoutBatch {
 	return &producerWriteBehindSinkWithoutBatch{
-		next:       1,
-		queueState: QueueState{NextOutboundSeq: 1},
+		next:          1,
+		queueState:    QueueState{NextOutboundSeq: 1},
+		inboundFrames: make(map[FrameKey]Frame),
 	}
 }
 
@@ -376,7 +391,25 @@ func (s *producerWriteBehindSinkWithoutBatch) SaveInboundIfAbsent(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "SaveInboundIfAbsent:"+itoa(frame.Key.Seq))
-	return true, frame.Clone(), nil
+	if stored, ok := s.inboundFrames[frame.Key]; ok {
+		return false, stored.Clone(), nil
+	}
+	stored := frame.Clone()
+	s.inboundFrames[frame.Key] = stored
+	for {
+		next := s.consumerAckedThrough + 1
+		key := FrameKey{
+			QueueID:   frame.Key.QueueID,
+			Stream:    frame.Key.Stream,
+			Seq:       next,
+			Direction: DirectionInbound,
+		}
+		if _, ok := s.inboundFrames[key]; !ok {
+			break
+		}
+		s.consumerAckedThrough = next
+	}
+	return true, stored.Clone(), nil
 }
 
 func (s *producerWriteBehindSinkWithoutBatch) ListOutboundReplay(
@@ -409,6 +442,18 @@ func (s *producerWriteBehindSinkWithoutBatch) ListInboundReplay(
 	_ = stream
 	_ = limit
 	return nil, nil
+}
+
+func (s *producerWriteBehindSinkWithoutBatch) ConsumerAckedThrough(
+	ctx context.Context,
+	queueID string,
+	stream Stream,
+) (int64, error) {
+	_ = ctx
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "ConsumerAckedThrough:"+queueID+":"+string(stream))
+	return s.consumerAckedThrough, nil
 }
 
 func (s *producerWriteBehindSinkWithoutBatch) MarkSent(ctx context.Context, key FrameKey) error {

@@ -350,6 +350,61 @@ func TestAckOutboundThrough(t *testing.T) {
 	require.Equal(t, reliablemq.StatusPending, mustGet(t, store, otherQueue.Key).Status)
 }
 
+func TestListOutboundReplayFromUsesExactCursorAndLimit(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		_, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+		require.NoError(t, err)
+	}
+
+	// When
+	frames, err := store.ListOutboundReplayFrom(ctx, "conn_1", reliablemq.StreamACP, 3, 2)
+
+	// Then
+	require.NoError(t, err)
+	require.Len(t, frames, 2)
+	require.Equal(t, int64(3), frames[0].Key.Seq)
+	require.Equal(t, int64(4), frames[1].Key.Seq)
+}
+
+func TestMarkRejectedAdvancesInboundAppliedCursor(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	frame := saveInbound(t, store, 1)
+
+	// When
+	require.NoError(t, store.MarkRejected(ctx, frame.Key, "denied"))
+
+	// Then
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), state.InboundAppliedThrough)
+}
+
+func TestApplyBatchRejectedFrameAdvancesInboundAppliedCursor(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	frame := reliablemq.Frame{
+		Key:          reliablemq.FrameKey{QueueID: "conn_1", Stream: reliablemq.StreamACP, Seq: 1, Direction: reliablemq.DirectionInbound},
+		Kind:         reliablemq.FrameKindData,
+		Payload:      []byte(`{}`),
+		Status:       reliablemq.StatusRejected,
+		ErrorMessage: "denied",
+	}
+
+	// When
+	require.NoError(t, store.ApplyBatch(ctx, reliablemq.StoreBatch{Frames: []reliablemq.Frame{frame}}))
+
+	// Then
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), state.InboundAppliedThrough)
+}
+
 func TestStatusTransitions(t *testing.T) {
 	// Given
 	store := newTestStore(t)

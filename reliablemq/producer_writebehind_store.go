@@ -85,6 +85,7 @@ type ProducerWriteBehindStore struct {
 	config ProducerWriteBehindStoreConfig
 
 	mu           sync.Mutex
+	flushMu      sync.Mutex
 	queues       map[producerQueueKey]producerQueueState
 	frames       map[FrameKey]Frame
 	dirtyFrames  map[FrameKey]Frame
@@ -104,8 +105,9 @@ type producerQueueKey struct {
 }
 
 type producerQueueState struct {
-	nextOutboundSeq int64
-	loaded          bool
+	nextOutboundSeq  int64
+	persistedThrough int64
+	loaded           bool
 }
 
 func NewProducerWriteBehindStore(
@@ -179,15 +181,49 @@ func (s *ProducerWriteBehindStore) ListOutboundReplay(
 	stream Stream,
 	limit int,
 ) ([]Frame, error) {
-	frames, err := s.sink.ListOutboundReplay(ctx, queueID, stream, limit)
-	if err != nil {
-		return nil, err
+	return s.listOutboundReplayFrom(ctx, queueID, stream, 1, limit)
+}
+
+func (s *ProducerWriteBehindStore) ListOutboundReplayFrom(
+	ctx context.Context,
+	queueID string,
+	stream Stream,
+	fromSeq int64,
+	limit int,
+) ([]Frame, error) {
+	if fromSeq <= 0 {
+		return nil, fmt.Errorf("%w: from seq must be positive", ErrInvalidFrame)
 	}
+	return s.listOutboundReplayFrom(ctx, queueID, stream, fromSeq, limit)
+}
+
+func (s *ProducerWriteBehindStore) listOutboundReplayFrom(
+	ctx context.Context,
+	queueID string,
+	stream Stream,
+	fromSeq int64,
+	limit int,
+) ([]Frame, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	var (
+		frames []Frame
+		err    error
+	)
+	if cursor, ok := s.sink.(OutboundCursorStore); ok {
+		frames, err = cursor.ListOutboundReplayFrom(ctx, queueID, stream, fromSeq, limit)
+	} else {
+		frames, err = s.sink.ListOutboundReplay(ctx, queueID, stream, 1_000_000)
+	}
+	if err != nil {
+		return nil, err
+	}
 	byKey := make(map[FrameKey]Frame, len(frames))
 	for _, frame := range frames {
+		if frame.Key.Seq < fromSeq {
+			continue
+		}
 		byKey[frame.Key] = frame.Clone()
 	}
 
@@ -196,10 +232,14 @@ func (s *ProducerWriteBehindStore) ListOutboundReplay(
 		if key.QueueID != queueID ||
 			key.Stream != stream ||
 			key.Direction != DirectionOutbound ||
-			(frame.Status != StatusPending && frame.Status != StatusSent) {
+			key.Seq < fromSeq {
 			continue
 		}
-		byKey[key] = frame.Clone()
+		if frame.Status == StatusPending || frame.Status == StatusSent {
+			byKey[key] = frame.Clone()
+		} else {
+			delete(byKey, key)
+		}
 	}
 	s.mu.Unlock()
 
@@ -216,6 +256,12 @@ func (s *ProducerWriteBehindStore) ListOutboundReplay(
 	return merged, nil
 }
 
+func (s *ProducerWriteBehindStore) PersistedThrough(queueID string, stream Stream) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queues[producerQueueKey{queueID: queueID, stream: stream}].persistedThrough
+}
+
 func (s *ProducerWriteBehindStore) ListInboundReplay(
 	ctx context.Context,
 	queueID string,
@@ -223,6 +269,18 @@ func (s *ProducerWriteBehindStore) ListInboundReplay(
 	limit int,
 ) ([]Frame, error) {
 	return s.sink.ListInboundReplay(ctx, queueID, stream, limit)
+}
+
+func (s *ProducerWriteBehindStore) ConsumerAckedThrough(
+	ctx context.Context,
+	queueID string,
+	stream Stream,
+) (int64, error) {
+	checker, ok := s.sink.(ReconcileConsumerStore)
+	if !ok {
+		return 0, nil
+	}
+	return checker.ConsumerAckedThrough(ctx, queueID, stream)
 }
 
 func (s *ProducerWriteBehindStore) LoadProducerReconcileCheckpoint(
@@ -413,6 +471,8 @@ func (s *ProducerWriteBehindStore) UpdateMetadata(
 }
 
 func (s *ProducerWriteBehindStore) Flush(ctx context.Context) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	snapshot := s.snapshot()
 	if snapshot.empty() {
 		return nil
@@ -421,7 +481,7 @@ func (s *ProducerWriteBehindStore) Flush(ctx context.Context) error {
 		s.recordFlushFailure(snapshot, err)
 		return err
 	}
-	s.recordFlushSuccess()
+	s.recordFlushSuccess(snapshot)
 	return nil
 }
 
@@ -518,6 +578,7 @@ func (s *ProducerWriteBehindStore) queueStateLocked(
 			state.nextOutboundSeq = loaded.NextOutboundSeq
 		}
 	}
+	state.persistedThrough = state.nextOutboundSeq - 1
 	state.loaded = true
 	s.queues[key] = state
 	return state, nil
@@ -764,9 +825,24 @@ func (s *ProducerWriteBehindStore) recordFlushFailure(
 	}
 }
 
-func (s *ProducerWriteBehindStore) recordFlushSuccess() {
+func (s *ProducerWriteBehindStore) recordFlushSuccess(snapshot producerWriteBehindSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, frame := range snapshot.frames {
+		queueKey := producerQueueKey{queueID: frame.Key.QueueID, stream: frame.Key.Stream}
+		state := s.queues[queueKey]
+		if frame.Key.Seq > state.persistedThrough {
+			state.persistedThrough = frame.Key.Seq
+			s.queues[queueKey] = state
+		}
+		if _, dirtyFrame := s.dirtyFrames[frame.Key]; dirtyFrame {
+			continue
+		}
+		if _, dirtyPatch := s.dirtyPatches[frame.Key]; dirtyPatch {
+			continue
+		}
+		delete(s.frames, frame.Key)
+	}
 	s.stats.Degraded = false
 	s.stats.ConsecutiveFlushFailures = 0
 	s.stats.LastFlushError = ""
@@ -839,3 +915,6 @@ func replayBounds(frames []Frame) (int64, int64) {
 
 var _ DurableStore = (*ProducerWriteBehindStore)(nil)
 var _ ReconcileProducerStore = (*ProducerWriteBehindStore)(nil)
+var _ ReconcileConsumerStore = (*ProducerWriteBehindStore)(nil)
+var _ OutboundCursorStore = (*ProducerWriteBehindStore)(nil)
+var _ ProducerPersistence = (*ProducerWriteBehindStore)(nil)

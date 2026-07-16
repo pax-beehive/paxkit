@@ -8,8 +8,9 @@ import (
 // DurableStore is implemented by paxd, pax-manager, or another host process
 // using its own database and transaction machinery.
 type DurableStore interface {
-	// AppendOutboundData atomically allocates the next outbound seq and durably
-	// records a data frame before any network send.
+	// AppendOutboundData atomically allocates the next outbound seq and records a
+	// data frame in this store layer. ProducerWriteBehindStore may stage the frame
+	// in memory before asynchronously flushing it to its durable sink.
 	AppendOutboundData(
 		ctx context.Context,
 		queueID string,
@@ -19,7 +20,8 @@ type DurableStore interface {
 	) (Frame, error)
 
 	// AppendOutboundTombstone atomically allocates the next outbound seq and
-	// durably records a tombstone frame before any network send.
+	// records a tombstone in this store layer. ProducerWriteBehindStore may stage
+	// the frame in memory before asynchronously flushing it to its durable sink.
 	AppendOutboundTombstone(
 		ctx context.Context,
 		queueID string,
@@ -89,4 +91,24 @@ type ReconcileProducerStore interface {
 
 type ReconcileConsumerStore interface {
 	ConsumerAckedThrough(ctx context.Context, queueID string, stream Stream) (int64, error)
+}
+
+// OutboundCursorStore reads replayable outbound frames starting at an exact
+// sequence. The producer uses it to page through a journal without marking each
+// successful socket write as sent.
+type OutboundCursorStore interface {
+	ListOutboundReplayFrom(
+		ctx context.Context,
+		queueID string,
+		stream Stream,
+		fromSeq int64,
+		limit int,
+	) ([]Frame, error)
+}
+
+// ProducerPersistence reports the highest outbound sequence known to have
+// reached the journal. It lets the producer evict persisted hot entries while a
+// network connection is unavailable.
+type ProducerPersistence interface {
+	PersistedThrough(queueID string, stream Stream) int64
 }

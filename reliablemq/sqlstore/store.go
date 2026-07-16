@@ -289,6 +289,22 @@ func (s *Store) ListOutboundReplay(
 	})
 }
 
+func (s *Store) ListOutboundReplayFrom(
+	ctx context.Context,
+	queueID string,
+	stream reliablemq.Stream,
+	fromSeq int64,
+	limit int,
+) ([]reliablemq.Frame, error) {
+	if fromSeq <= 0 {
+		return nil, fmt.Errorf("%w: from seq must be positive", reliablemq.ErrInvalidFrame)
+	}
+	return s.listFrom(ctx, queueID, stream, reliablemq.DirectionOutbound, fromSeq, limit, []reliablemq.Status{
+		reliablemq.StatusPending,
+		reliablemq.StatusSent,
+	})
+}
+
 func (s *Store) ListInboundReplay(
 	ctx context.Context,
 	queueID string,
@@ -456,7 +472,8 @@ func (s *Store) ApplyBatch(ctx context.Context, batch reliablemq.StoreBatch) err
 		if err := s.applyFrameStateTx(ctx, tx, frame); err != nil {
 			return err
 		}
-		if frame.Key.Direction == reliablemq.DirectionInbound && frame.Status == reliablemq.StatusApplied {
+		if frame.Key.Direction == reliablemq.DirectionInbound &&
+			(frame.Status == reliablemq.StatusApplied || frame.Status == reliablemq.StatusRejected) {
 			if err := s.updateInboundAppliedThroughTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream, frame.Key.Seq); err != nil {
 				return err
 			}
@@ -509,7 +526,20 @@ func (s *Store) MarkApplied(ctx context.Context, key reliablemq.FrameKey) error 
 }
 
 func (s *Store) MarkRejected(ctx context.Context, key reliablemq.FrameKey, errorMessage string) error {
-	return s.updateStatus(ctx, key, reliablemq.StatusRejected, errorMessage)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	if err := s.updateStatusTx(ctx, tx, key, reliablemq.StatusRejected, errorMessage); err != nil {
+		return err
+	}
+	if key.Direction == reliablemq.DirectionInbound {
+		if err := s.updateInboundAppliedThroughTx(ctx, tx, key.QueueID, key.Stream, key.Seq); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RecordSendFailure(ctx context.Context, key reliablemq.FrameKey, errorMessage string) error {
@@ -1004,11 +1034,23 @@ func (s *Store) list(
 	limit int,
 	statuses []reliablemq.Status,
 ) ([]reliablemq.Frame, error) {
+	return s.listFrom(ctx, queueID, stream, direction, 1, limit, statuses)
+}
+
+func (s *Store) listFrom(
+	ctx context.Context,
+	queueID string,
+	stream reliablemq.Stream,
+	direction reliablemq.Direction,
+	fromSeq int64,
+	limit int,
+	statuses []reliablemq.Status,
+) ([]reliablemq.Frame, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	b := s.dialect.bind
-	args := []any{queueID, string(stream), string(direction)}
+	args := []any{queueID, string(stream), string(direction), fromSeq}
 	for _, status := range statuses {
 		args = append(args, string(status))
 	}
@@ -1016,11 +1058,12 @@ func (s *Store) list(
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT queue_id, stream, seq, direction, kind, COALESCE(payload_json, ''),
 			metadata_json, status, error_message, created_at, updated_at
-		FROM `+s.tableName+`
-		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+` AND direction = `+b(3)+`
-			AND status IN (`+placeholders(s.dialect, 4, len(statuses))+`)
-		ORDER BY seq
-		LIMIT `+b(4+len(statuses))+`
+			FROM `+s.tableName+`
+			WHERE queue_id = `+b(1)+` AND stream = `+b(2)+` AND direction = `+b(3)+`
+				AND seq >= `+b(4)+`
+				AND status IN (`+placeholders(s.dialect, 5, len(statuses))+`)
+			ORDER BY seq
+			LIMIT `+b(5+len(statuses))+`
 	`, args...)
 	if err != nil {
 		return nil, err
@@ -1112,6 +1155,11 @@ func (s *Store) applyPatchTx(ctx context.Context, tx *sql.Tx, patch reliablemq.S
 	case reliablemq.StatusRejected:
 		if err := s.updateStatusTx(ctx, tx, patch.Key, reliablemq.StatusRejected, patch.ErrorMessage); err != nil {
 			return err
+		}
+		if patch.Key.Direction == reliablemq.DirectionInbound {
+			if err := s.updateInboundAppliedThroughTx(ctx, tx, patch.Key.QueueID, patch.Key.Stream, patch.Key.Seq); err != nil {
+				return err
+			}
 		}
 	default:
 		return fmt.Errorf("%w: invalid status %q", reliablemq.ErrInvalidFrame, patch.Status)
