@@ -152,60 +152,76 @@ Expected:
 
 ### Outbound Send
 
-#### Given outbound hook continues, when Send is called, then data is durably appended before network send
-
-Expected call order:
-
-```text
-BeforeSend -> AppendOutboundData -> Sender.Send(data) -> MarkSent
-```
-
-#### Given outbound hook returns tombstone, when Send is called, then a tombstone is durably appended and sent
+#### Given the journal sink and socket writer are blocked, when Send is called, then acceptance still returns
 
 Expected:
 
-- `AppendOutboundTombstone`
-- `Sender.Send(tombstone)`
-- no data payload in envelope
-- `MarkSent`
+- `Send` returns after validation, local hooks, and MPSC acceptance
+- `Send` does not wait for journal flush, socket write, reconnect, or ACK
+- success does not promise that the accepted tail survives a process crash
 
-#### Given outbound hook returns runtime error, when policy is OutboundHookErrorTombstone, then Send appends and sends a tombstone with err.Error()
-
-Expected:
-
-- `AppendOutboundTombstone(error_message=err.Error())`
-- `Sender.Send(tombstone)`
-- `MarkSent`
-
-#### Given network send fails after durable append, when Send is called, then send failure is recorded and the frame remains replayable
+#### Given concurrent callers, when Send accepts their messages, then the owner assigns unique contiguous sequence numbers
 
 Expected:
 
-- append called
-- sender called and returns error
-- `RecordSendFailure`
-- `MarkSent` not called
-- `Send` returns error
+- no caller blocks on a bounded ingress channel
+- one owner goroutine sequences all accepted entries
+- resulting sequence numbers are unique and contiguous
 
-#### Given MarkSent fails after network send succeeds, when Send is called, then Send returns error
+#### Given journal flush is delayed and a socket is healthy, when a message is accepted, then network send does not wait for persistence
 
 Expected:
 
-- append called
-- sender called
-- `MarkSent` called and returns error
-- caller receives error
-- at-least-once replay may resend later
+- network cursor may advance ahead of `persistedThrough`
+- the frame remains in the hot log until it is persisted or ACKed
+- this send-first interval is an explicit crash-loss window
+
+#### Given an outbound hook returns tombstone or a runtime error, when Send accepts the decision, then the owner sequences a tombstone
+
+Expected:
+
+- tombstone consumes the next sequence number
+- tombstone has no data payload
+- runtime error is stored as the tombstone `error_message`
+- sequencing, journal flush, and network write happen after acceptance
+
+#### Given unpersisted bytes or age exceeds its configured limit, when producer maintenance runs, then the producer fails explicitly
+
+Expected:
+
+- `OnError` receives `ErrProducerJournalLimit`
+- later `Send` calls return `ErrProducerNotReady`
+- no accepted frame is silently discarded to stay under the limit
+
+#### Given the head socket write fails, when the producer reconnects, then later frames cannot bypass the failed head
+
+Expected:
+
+- the failed binding is disabled
+- the next generation resumes from the same head
+- later data remains ordered behind it
+
+#### Given socket writes succeed, when cumulative ACK advances, then no per-frame sent patch is required
+
+Expected:
+
+- data and ACK envelopes share one connection-owned writer
+- network success advances only the in-memory cursor
+- cumulative `AckOutboundThrough` is coalesced into journal persistence
+- stale `pending` and legacy `sent` rows are equally replayable until ACKed
 
 ### Inbound Receive
 
-#### Given inbound data is new, when Receive is called, then it stores before ACK and dispatches before MarkApplied
+#### Given inbound data is new, when Receive is called, then it stores before ACK submission and dispatches before MarkApplied
 
 Expected call order:
 
 ```text
-SaveInboundIfAbsent -> Sender.Send(ack) -> BeforeDispatch -> Dispatcher.Dispatch -> MarkApplied
+SaveInboundIfAbsent -> Producer.submitInboundACK -> BeforeDispatch -> Dispatcher.Dispatch -> MarkApplied
 ```
+
+ACK submission is non-blocking and the producer coalesces it onto the same
+connection-owned writer used for data.
 
 #### Given inbound data is duplicate, when Receive is called, then it ACKs but does not run hooks or dispatch
 
@@ -273,27 +289,36 @@ Expected:
 
 Expected:
 
-- `AckOutboundThrough(queue_id, stream, seq)`
+- producer owner advances `ackedThrough`
+- journal persistence coalesces `AckOutboundThrough(queue_id, stream, seq)`
 - no ACK response sent
 - no dispatcher
 
 ### Replay
 
-#### Given pending and sent outbound frames, when ReplayOutbound is called, then frames are sent in seq order
+#### Given more frames than one cursor page, when a producer binds after reconnect, then every replayable frame is sent in seq order
 
 Expected:
 
-- store returns ordered frames
-- sender receives ordered data/tombstone envelopes
-- `MarkSent` called for each successful send
+- producer pages from the exact `nextToSend`
+- all pages are drained, not only the first configured batch
+- pending and legacy sent rows are treated identically
+- no per-frame `MarkSent` patch is written
 
-#### Given outbound replay send fails, when ReplayOutbound is called, then failure is recorded and replay stops
+#### Given live output arrives while backlog replay is blocked, when the writer resumes, then live output cannot overtake backlog
 
 Expected:
 
-- `RecordSendFailure`
-- returns error
-- later frames are not sent in that run
+- backlog and live output use the same cursor
+- sequence order is preserved across the replay/live boundary
+
+#### Given an outbound replay write fails, when the connection generation is disabled, then the cursor remains at the failed head
+
+Expected:
+
+- later frames are not sent on that binding
+- a new binding resumes from peer `ackedThrough + 1`
+- old-generation cleanup cannot detach the new binding
 
 #### Given received inbound frames, when ReplayInbound is called, then data frames are dispatched in seq order
 

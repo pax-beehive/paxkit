@@ -13,4 +13,9 @@
 //
 // ACKs are cumulative through seq and mean only that the peer has durably
 // recorded the frame. They do not mean business processing has completed.
+//
+// Send accepts an owned copy into a process-owned producer. A successful Send
+// does not mean that the frame has been flushed to the durable journal, written
+// to the network, or ACKed. The network cursor may send ahead of the journal
+// flusher; a process crash can therefore lose an accepted but unflushed tail.
 package reliablemq

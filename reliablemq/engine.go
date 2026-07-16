@@ -39,13 +39,13 @@ type Config struct {
 type Engine struct {
 	config          Config
 	Store           DurableStore
-	Sender          Sender
+	Producer        *Producer
 	Dispatcher      Dispatcher
 	outboundHandler OutboundHandler
 	inboundHandler  InboundHandler
 }
 
-func NewEngine(config Config, store DurableStore, sender Sender, dispatcher Dispatcher, opts ...Option) *Engine {
+func NewEngine(config Config, store DurableStore, producer *Producer, dispatcher Dispatcher, opts ...Option) *Engine {
 	if config.OutboundHookErrorPolicy == "" {
 		config.OutboundHookErrorPolicy = OutboundHookErrorTombstone
 	}
@@ -58,19 +58,29 @@ func NewEngine(config Config, store DurableStore, sender Sender, dispatcher Disp
 	return &Engine{
 		config:          config,
 		Store:           store,
-		Sender:          sender,
+		Producer:        producer,
 		Dispatcher:      dispatcher,
 		outboundHandler: buildOutboundHandler(options.outbound),
 		inboundHandler:  buildInboundHandler(options.inbound),
 	}
 }
 
-func (e *Engine) Send(ctx context.Context, msg OutboundMessage) (Frame, error) {
+func (e *Engine) Send(ctx context.Context, msg OutboundMessage) error {
 	if err := validateEngine(e, true, false); err != nil {
-		return Frame{}, err
+		return err
 	}
 	if err := ValidateOutboundMessage(msg); err != nil {
-		return Frame{}, err
+		return err
+	}
+	if msg.QueueID != e.Producer.config.QueueID || msg.Stream != e.Producer.config.Stream {
+		return fmt.Errorf(
+			"%w: message queue %q/%q does not match producer %q/%q",
+			ErrInvalidFrame,
+			msg.QueueID,
+			msg.Stream,
+			e.Producer.config.QueueID,
+			e.Producer.config.Stream,
+		)
 	}
 
 	msg.Metadata = msg.Metadata.Clone()
@@ -83,26 +93,33 @@ func (e *Engine) Send(ctx context.Context, msg OutboundMessage) (Frame, error) {
 		}
 	}
 
-	frame, err := e.appendOutboundFromDecision(ctx, msg, decision)
+	entry, err := acceptedOutboundFromDecision(msg, decision)
 	if err != nil {
-		return Frame{}, err
+		return err
 	}
-	if err := e.sendFrame(ctx, frame); err != nil {
-		return frame, err
-	}
-	return frame, nil
+	return e.Producer.accept(ctx, entry)
 }
 
 func (e *Engine) Receive(ctx context.Context, env Envelope) error {
-	if err := validateEngine(e, false, false); err != nil {
+	if err := validateEngine(e, true, false); err != nil {
 		return err
 	}
 	if err := ValidateEnvelope(env); err != nil {
 		return err
 	}
+	if env.QueueID != e.Producer.config.QueueID || env.Stream != e.Producer.config.Stream {
+		return fmt.Errorf(
+			"%w: envelope queue %q/%q does not match producer %q/%q",
+			ErrInvalidEnvelope,
+			env.QueueID,
+			env.Stream,
+			e.Producer.config.QueueID,
+			e.Producer.config.Stream,
+		)
+	}
 	switch env.Type {
 	case EnvelopeTypeAck:
-		return e.Store.AckOutboundThrough(ctx, env.QueueID, env.Stream, env.Seq)
+		return e.Producer.acknowledge(env.Seq)
 	case EnvelopeTypeData, EnvelopeTypeTombstone:
 		return e.receiveFrame(ctx, env)
 	default:
@@ -110,75 +127,109 @@ func (e *Engine) Receive(ctx context.Context, env Envelope) error {
 	}
 }
 
-func (e *Engine) ReplayOutbound(ctx context.Context, queueID string, stream Stream, limit int) error {
-	if err := validateEngine(e, true, false); err != nil {
-		return err
-	}
-	frames, err := e.Store.ListOutboundReplay(ctx, queueID, stream, limit)
-	if err != nil {
-		return err
-	}
-	for _, frame := range frames {
-		if err := ValidateFrame(frame); err != nil {
-			return err
-		}
-		if frame.Key.Direction != DirectionOutbound {
-			return fmt.Errorf("%w: replay outbound frame direction is %q", ErrInvalidFrame, frame.Key.Direction)
-		}
-		if err := e.sendFrame(ctx, frame); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (e *Engine) ReplayInbound(ctx context.Context, queueID string, stream Stream, limit int) error {
 	if err := validateEngine(e, false, true); err != nil {
 		return err
 	}
-	frames, err := e.Store.ListInboundReplay(ctx, queueID, stream, limit)
-	if err != nil {
-		return err
-	}
-	for _, frame := range frames {
-		if err := e.dispatchOrApplyInbound(ctx, frame); err != nil {
-			return err
-		}
-	}
-	return nil
+	return e.dispatchReadyInbound(ctx, queueID, stream, limit)
 }
 
-func (e *Engine) appendOutboundFromDecision(ctx context.Context, msg OutboundMessage, decision OutboundDecision) (Frame, error) {
+func acceptedOutboundFromDecision(msg OutboundMessage, decision OutboundDecision) (acceptedOutbound, error) {
 	metadata := decision.Metadata.Clone()
 	if metadata == nil {
 		metadata = msg.Metadata.Clone()
 	}
 	switch decision.Action {
 	case "", OutboundContinue:
-		return e.Store.AppendOutboundData(ctx, msg.QueueID, msg.Stream, msg.Payload, metadata)
+		return acceptedOutbound{
+			kind:     FrameKindData,
+			payload:  append([]byte(nil), msg.Payload...),
+			metadata: metadata,
+		}, nil
 	case OutboundTombstone:
-		return e.Store.AppendOutboundTombstone(ctx, msg.QueueID, msg.Stream, decision.ErrorMessage, metadata)
+		return acceptedOutbound{
+			kind:         FrameKindTombstone,
+			metadata:     metadata,
+			errorMessage: decision.ErrorMessage,
+		}, nil
 	default:
-		return Frame{}, fmt.Errorf("%w: unknown outbound action %q", ErrInvalidDecision, decision.Action)
+		return acceptedOutbound{}, fmt.Errorf("%w: unknown outbound action %q", ErrInvalidDecision, decision.Action)
 	}
 }
 
 func (e *Engine) receiveFrame(ctx context.Context, env Envelope) error {
-	if e.Sender == nil {
-		return fmt.Errorf("reliablemq: sender is required for inbound ACK")
-	}
 	frame := InboundFrameFromEnvelope(env)
 	inserted, stored, err := e.Store.SaveInboundIfAbsent(ctx, frame)
 	if err != nil {
 		return err
 	}
-	if err := e.Sender.Send(ctx, AckEnvelope(env.QueueID, env.Stream, env.Seq)); err != nil {
+	through := env.Seq
+	if checker, ok := e.Store.(ReconcileConsumerStore); ok {
+		through, err = checker.ConsumerAckedThrough(ctx, env.QueueID, env.Stream)
+		if err != nil {
+			return err
+		}
+	}
+	if err := e.Producer.submitInboundACK(through); err != nil {
 		return err
+	}
+	if _, ordered := e.Store.(QueueStateStore); ordered {
+		return e.dispatchReadyInbound(ctx, env.QueueID, env.Stream, 1000)
 	}
 	if !inserted {
 		return nil
 	}
 	return e.dispatchOrApplyInbound(ctx, stored)
+}
+
+func (e *Engine) dispatchReadyInbound(
+	ctx context.Context,
+	queueID string,
+	stream Stream,
+	limit int,
+) error {
+	if limit <= 0 {
+		limit = 100
+	}
+	next := int64(0)
+	if loader, ok := e.Store.(QueueStateStore); ok {
+		state, err := loader.LoadQueueState(ctx, queueID, stream)
+		if err != nil {
+			return err
+		}
+		next = state.InboundAppliedThrough + 1
+	}
+
+	for {
+		frames, err := e.Store.ListInboundReplay(ctx, queueID, stream, limit)
+		if err != nil {
+			return err
+		}
+		if len(frames) == 0 {
+			return nil
+		}
+		progressed := false
+		for _, frame := range frames {
+			if next > 0 {
+				if frame.Key.Seq < next {
+					continue
+				}
+				if frame.Key.Seq != next {
+					return nil
+				}
+			}
+			if err := e.dispatchOrApplyInbound(ctx, frame); err != nil {
+				return err
+			}
+			progressed = true
+			if next > 0 {
+				next++
+			}
+		}
+		if !progressed || len(frames) < limit {
+			return nil
+		}
+	}
 }
 
 func (e *Engine) dispatchOrApplyInbound(ctx context.Context, frame Frame) error {
@@ -215,18 +266,6 @@ func (e *Engine) dispatchOrApplyInbound(ctx context.Context, frame Frame) error 
 		return e.Store.RecordDispatchFailure(ctx, frame.Key, err.Error())
 	}
 	return e.Store.MarkApplied(ctx, frame.Key)
-}
-
-func (e *Engine) sendFrame(ctx context.Context, frame Frame) error {
-	env := EnvelopeFromFrame(frame)
-	if err := e.Sender.Send(ctx, env); err != nil {
-		_ = e.Store.RecordSendFailure(ctx, frame.Key, err.Error())
-		return err
-	}
-	if err := e.Store.MarkSent(ctx, frame.Key); err != nil {
-		return err
-	}
-	return nil
 }
 
 func ValidateOutboundMessage(msg OutboundMessage) error {
@@ -275,15 +314,15 @@ func ValidateFrame(frame Frame) error {
 	return nil
 }
 
-func validateEngine(e *Engine, needSender bool, needDispatcher bool) error {
+func validateEngine(e *Engine, needProducer bool, needDispatcher bool) error {
 	if e == nil {
 		return fmt.Errorf("reliablemq: engine is nil")
 	}
 	if e.Store == nil {
 		return fmt.Errorf("reliablemq: store is required")
 	}
-	if needSender && e.Sender == nil {
-		return fmt.Errorf("reliablemq: sender is required")
+	if needProducer && e.Producer == nil {
+		return fmt.Errorf("reliablemq: producer is required")
 	}
 	if needDispatcher && e.Dispatcher == nil {
 		return fmt.Errorf("reliablemq: dispatcher is required")

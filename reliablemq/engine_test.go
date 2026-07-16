@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -12,8 +15,8 @@ import (
 func TestEngineSendDataOrdering(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
-	engine := NewEngine(Config{}, store, sender, nil, WithOutboundMiddleware(
+	producer := newEngineTestProducer(t, store)
+	engine := NewEngine(Config{}, store, producer, nil, WithOutboundMiddleware(
 		func(next OutboundHandler) OutboundHandler {
 			return func(ctx context.Context, msg *OutboundMessage) (OutboundDecision, error) {
 				store.record("BeforeSend")
@@ -23,7 +26,7 @@ func TestEngineSendDataOrdering(t *testing.T) {
 	))
 
 	// When
-	frame, err := engine.Send(context.Background(), OutboundMessage{
+	err := engine.Send(context.Background(), OutboundMessage{
 		QueueID:  "conn_1",
 		Stream:   StreamACP,
 		Payload:  json.RawMessage(`{"ok":true}`),
@@ -32,8 +35,10 @@ func TestEngineSendDataOrdering(t *testing.T) {
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"BeforeSend", "AppendOutboundData", "Sender.Send:data:1", "MarkSent:1"}
-	require.Equal(t, wantOrder, store.calls)
+	require.Eventually(t, func() bool {
+		return store.callsEqual([]string{"BeforeSend", "AppendOutboundData"})
+	}, time.Second, time.Millisecond)
+	frame := store.lastOutboundFrame()
 	require.Equal(t, FrameKindData, frame.Kind)
 	require.Equal(t, StatusPending, frame.Status)
 }
@@ -41,14 +46,14 @@ func TestEngineSendDataOrdering(t *testing.T) {
 func TestEngineSendTombstone(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
-	engine := NewEngine(Config{}, store, sender, nil, WithOutboundMiddleware(outboundDecisionMiddleware(OutboundDecision{
+	producer := newEngineTestProducer(t, store)
+	engine := NewEngine(Config{}, store, producer, nil, WithOutboundMiddleware(outboundDecisionMiddleware(OutboundDecision{
 		Action:       OutboundTombstone,
 		ErrorMessage: "blocked",
 	})))
 
 	// When
-	frame, err := engine.Send(context.Background(), OutboundMessage{
+	err := engine.Send(context.Background(), OutboundMessage{
 		QueueID: "conn_1",
 		Stream:  StreamACP,
 		Payload: json.RawMessage(`{"ok":true}`),
@@ -56,23 +61,24 @@ func TestEngineSendTombstone(t *testing.T) {
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"AppendOutboundTombstone", "Sender.Send:tombstone:1", "MarkSent:1"}
-	require.Equal(t, wantOrder, store.calls)
+	require.Eventually(t, func() bool {
+		return store.callsEqual([]string{"AppendOutboundTombstone"})
+	}, time.Second, time.Millisecond)
+	frame := store.lastOutboundFrame()
 	require.Equal(t, FrameKindTombstone, frame.Kind)
 	require.Equal(t, "blocked", frame.ErrorMessage)
-	require.Empty(t, sender.sent[0].Payload)
-	require.Equal(t, "blocked", sender.sent[0].ErrorMessage)
+	require.Empty(t, frame.Payload)
 }
 
 func TestEngineSendHookErrorTombstone(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	hookErr := errors.New("hook unavailable")
-	engine := NewEngine(Config{OutboundHookErrorPolicy: OutboundHookErrorTombstone}, store, sender, nil, WithOutboundMiddleware(outboundErrorMiddleware(hookErr)))
+	engine := NewEngine(Config{OutboundHookErrorPolicy: OutboundHookErrorTombstone}, store, producer, nil, WithOutboundMiddleware(outboundErrorMiddleware(hookErr)))
 
 	// When
-	frame, err := engine.Send(context.Background(), OutboundMessage{
+	err := engine.Send(context.Background(), OutboundMessage{
 		QueueID: "conn_1",
 		Stream:  StreamACP,
 		Payload: json.RawMessage(`{"ok":true}`),
@@ -80,46 +86,20 @@ func TestEngineSendHookErrorTombstone(t *testing.T) {
 	require.NoError(t, err)
 
 	// Then
+	require.Eventually(t, func() bool {
+		return store.lastOutboundFrame().Key.Seq == 1
+	}, time.Second, time.Millisecond)
+	frame := store.lastOutboundFrame()
 	require.Equal(t, FrameKindTombstone, frame.Kind)
 	require.Equal(t, hookErr.Error(), frame.ErrorMessage)
-}
-
-func TestEngineSendNetworkFailure(t *testing.T) {
-	// Given
-	store := newSpyStore()
-	sender := newSpySender(store)
-	sender.err = errors.New("socket closed")
-	engine := NewEngine(Config{}, store, sender, nil)
-
-	// When
-	_, err := engine.Send(context.Background(), OutboundMessage{QueueID: "conn_1", Stream: StreamACP, Payload: json.RawMessage(`{}`)})
-
-	// Then
-	require.ErrorIs(t, err, sender.err)
-	wantOrder := []string{"AppendOutboundData", "Sender.Send:data:1", "RecordSendFailure:1:socket closed"}
-	require.Equal(t, wantOrder, store.calls)
-}
-
-func TestEngineSendMarkSentFailure(t *testing.T) {
-	// Given
-	store := newSpyStore()
-	store.markSentErr = errors.New("db unavailable")
-	sender := newSpySender(store)
-	engine := NewEngine(Config{}, store, sender, nil)
-
-	// When
-	_, err := engine.Send(context.Background(), OutboundMessage{QueueID: "conn_1", Stream: StreamACP, Payload: json.RawMessage(`{}`)})
-
-	// Then
-	require.ErrorIs(t, err, store.markSentErr)
 }
 
 func TestEngineReceiveDataOrdering(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	dispatcher := newSpyDispatcher(store)
-	engine := NewEngine(Config{}, store, sender, dispatcher, WithInboundMiddleware(
+	engine := NewEngine(Config{}, store, producer, dispatcher, WithInboundMiddleware(
 		func(next InboundHandler) InboundHandler {
 			return func(ctx context.Context, frame *Frame) (InboundDecision, error) {
 				store.record("BeforeDispatch")
@@ -133,17 +113,20 @@ func TestEngineReceiveDataOrdering(t *testing.T) {
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"SaveInboundIfAbsent:1", "Sender.Send:ack:1", "BeforeDispatch", "UpdateMetadata:1", "Dispatcher.Dispatch:1", "MarkApplied:1"}
-	require.Equal(t, wantOrder, store.calls)
+	wantOrder := []string{"SaveInboundIfAbsent:1", "BeforeDispatch", "UpdateMetadata:1", "Dispatcher.Dispatch:1", "MarkApplied:1"}
+	require.Equal(t, wantOrder, store.callSnapshot())
+	require.Eventually(t, func() bool {
+		return producer.Stats().PendingACKThrough == 1
+	}, time.Second, time.Millisecond)
 }
 
 func TestEngineReceiveDuplicate(t *testing.T) {
 	// Given
 	store := newSpyStore()
 	store.saveInboundInserted = false
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	dispatcher := newSpyDispatcher(store)
-	engine := NewEngine(Config{}, store, sender, dispatcher, WithInboundMiddleware(
+	engine := NewEngine(Config{}, store, producer, dispatcher, WithInboundMiddleware(
 		func(next InboundHandler) InboundHandler {
 			return func(ctx context.Context, frame *Frame) (InboundDecision, error) {
 				require.FailNow(t, "BeforeDispatch should not run for duplicate inbound")
@@ -157,17 +140,17 @@ func TestEngineReceiveDuplicate(t *testing.T) {
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"SaveInboundIfAbsent:1", "Sender.Send:ack:1"}
-	require.Equal(t, wantOrder, store.calls)
+	wantOrder := []string{"SaveInboundIfAbsent:1"}
+	require.Equal(t, wantOrder, store.callSnapshot())
 	require.False(t, dispatcher.called)
 }
 
 func TestEngineReceiveHookReject(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	dispatcher := newSpyDispatcher(store)
-	engine := NewEngine(Config{}, store, sender, dispatcher, WithInboundMiddleware(inboundDecisionMiddleware(InboundDecision{
+	engine := NewEngine(Config{}, store, producer, dispatcher, WithInboundMiddleware(inboundDecisionMiddleware(InboundDecision{
 		Action:       InboundReject,
 		ErrorMessage: "denied",
 	})))
@@ -177,126 +160,105 @@ func TestEngineReceiveHookReject(t *testing.T) {
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"SaveInboundIfAbsent:1", "Sender.Send:ack:1", "UpdateMetadata:1", "MarkRejected:1:denied"}
-	require.Equal(t, wantOrder, store.calls)
+	wantOrder := []string{"SaveInboundIfAbsent:1", "UpdateMetadata:1", "MarkRejected:1:denied"}
+	require.Equal(t, wantOrder, store.callSnapshot())
 	require.False(t, dispatcher.called)
 }
 
 func TestEngineReceiveHookError(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	dispatcher := newSpyDispatcher(store)
 	hookErr := errors.New("policy timeout")
-	engine := NewEngine(Config{}, store, sender, dispatcher, WithInboundMiddleware(inboundErrorMiddleware(hookErr)))
+	engine := NewEngine(Config{}, store, producer, dispatcher, WithInboundMiddleware(inboundErrorMiddleware(hookErr)))
 
 	// When
 	err := engine.Receive(context.Background(), Envelope{Type: EnvelopeTypeData, QueueID: "conn_1", Stream: StreamACP, Seq: 1, Payload: json.RawMessage(`{}`)})
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"SaveInboundIfAbsent:1", "Sender.Send:ack:1", "RecordDispatchFailure:1:policy timeout"}
-	require.Equal(t, wantOrder, store.calls)
+	wantOrder := []string{"SaveInboundIfAbsent:1", "RecordDispatchFailure:1:policy timeout"}
+	require.Equal(t, wantOrder, store.callSnapshot())
 	require.False(t, dispatcher.called)
 }
 
 func TestEngineReceiveDispatchError(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	dispatcher := newSpyDispatcher(store)
 	dispatcher.err = errors.New("stdin closed")
-	engine := NewEngine(Config{}, store, sender, dispatcher)
+	engine := NewEngine(Config{}, store, producer, dispatcher)
 
 	// When
 	err := engine.Receive(context.Background(), Envelope{Type: EnvelopeTypeData, QueueID: "conn_1", Stream: StreamACP, Seq: 1, Payload: json.RawMessage(`{}`)})
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"SaveInboundIfAbsent:1", "Sender.Send:ack:1", "UpdateMetadata:1", "Dispatcher.Dispatch:1", "RecordDispatchFailure:1:stdin closed"}
-	require.Equal(t, wantOrder, store.calls)
+	wantOrder := []string{"SaveInboundIfAbsent:1", "UpdateMetadata:1", "Dispatcher.Dispatch:1", "RecordDispatchFailure:1:stdin closed"}
+	require.Equal(t, wantOrder, store.callSnapshot())
 }
 
 func TestEngineReceiveTombstone(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
+	producer := newEngineTestProducer(t, store)
 	dispatcher := newSpyDispatcher(store)
-	engine := NewEngine(Config{}, store, sender, dispatcher)
+	engine := NewEngine(Config{}, store, producer, dispatcher)
 
 	// When
 	err := engine.Receive(context.Background(), Envelope{Type: EnvelopeTypeTombstone, QueueID: "conn_1", Stream: StreamACP, Seq: 2, ErrorMessage: "blocked"})
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"SaveInboundIfAbsent:2", "Sender.Send:ack:2", "MarkApplied:2"}
-	require.Equal(t, wantOrder, store.calls)
+	wantOrder := []string{"SaveInboundIfAbsent:2", "MarkApplied:2"}
+	require.Equal(t, wantOrder, store.callSnapshot())
 	require.False(t, dispatcher.called)
 }
 
 func TestEngineReceiveACK(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	engine := NewEngine(Config{}, store, newSpySender(store), nil)
+	producer := newEngineTestProducer(t, store)
+	engine := NewEngine(Config{}, store, producer, nil)
 
 	// When
 	err := engine.Receive(context.Background(), AckEnvelope("conn_1", StreamACP, 4))
 	require.NoError(t, err)
 
 	// Then
-	wantOrder := []string{"AckOutboundThrough:4"}
-	require.Equal(t, wantOrder, store.calls)
+	require.Eventually(t, func() bool {
+		return store.callsEqual([]string{"AckOutboundThrough:4"})
+	}, time.Second, time.Millisecond)
 }
 
 func TestEngineReceiveInvalidEnvelope(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	sender := newSpySender(store)
-	engine := NewEngine(Config{}, store, sender, nil)
+	producer := newEngineTestProducer(t, store)
+	engine := NewEngine(Config{}, store, producer, nil)
 
 	// When
 	err := engine.Receive(context.Background(), Envelope{Type: "unknown", QueueID: "conn_1", Stream: StreamACP, Seq: 1})
 
 	// Then
 	require.ErrorIs(t, err, ErrInvalidEnvelope)
-	require.Empty(t, store.calls)
-	require.Empty(t, sender.sent)
+	require.Empty(t, store.callSnapshot())
 }
 
-func TestEngineReplayOutboundOrdering(t *testing.T) {
+func TestEngineReceiveRejectsDifferentProducerPartition(t *testing.T) {
 	// Given
 	store := newSpyStore()
-	store.outboundReplay = []Frame{
-		testFrame(1, DirectionOutbound, FrameKindData),
-		testFrame(2, DirectionOutbound, FrameKindTombstone),
-	}
-	sender := newSpySender(store)
-	engine := NewEngine(Config{}, store, sender, nil)
+	producer := newEngineTestProducer(t, store)
+	engine := NewEngine(Config{}, store, producer, nil)
 
 	// When
-	err := engine.ReplayOutbound(context.Background(), "conn_1", StreamACP, 100)
-	require.NoError(t, err)
+	err := engine.Receive(context.Background(), AckEnvelope("other_queue", StreamACP, 1))
 
 	// Then
-	wantOrder := []string{"ListOutboundReplay", "Sender.Send:data:1", "MarkSent:1", "Sender.Send:tombstone:2", "MarkSent:2"}
-	require.Equal(t, wantOrder, store.calls)
-}
-
-func TestEngineReplayOutboundFailure(t *testing.T) {
-	// Given
-	store := newSpyStore()
-	store.outboundReplay = []Frame{testFrame(1, DirectionOutbound, FrameKindData), testFrame(2, DirectionOutbound, FrameKindData)}
-	sender := newSpySender(store)
-	sender.err = errors.New("socket closed")
-	engine := NewEngine(Config{}, store, sender, nil)
-
-	// When
-	err := engine.ReplayOutbound(context.Background(), "conn_1", StreamACP, 100)
-
-	// Then
-	require.ErrorIs(t, err, sender.err)
-	wantOrder := []string{"ListOutboundReplay", "Sender.Send:data:1", "RecordSendFailure:1:socket closed"}
-	require.Equal(t, wantOrder, store.calls)
+	require.ErrorIs(t, err, ErrInvalidEnvelope)
+	require.Empty(t, store.callSnapshot())
 }
 
 func TestEngineReplayInboundOrdering(t *testing.T) {
@@ -315,16 +277,32 @@ func TestEngineReplayInboundOrdering(t *testing.T) {
 
 	// Then
 	wantOrder := []string{"ListInboundReplay", "UpdateMetadata:1", "Dispatcher.Dispatch:1", "MarkApplied:1", "MarkApplied:2"}
-	require.Equal(t, wantOrder, store.calls)
+	require.Equal(t, wantOrder, store.callSnapshot())
+}
+
+func newEngineTestProducer(t *testing.T, store DurableStore) *Producer {
+	t.Helper()
+	producer, err := NewProducer(context.Background(), ProducerConfig{
+		QueueID: "conn_1",
+		Stream:  StreamACP,
+	}, store)
+	require.NoError(t, err)
+	t.Cleanup(func() { closeProducer(t, producer) })
+	if spy, ok := store.(*spyStore); ok {
+		spy.resetCalls()
+	}
+	return producer
 }
 
 type spyStore struct {
+	mu                  sync.Mutex
 	calls               []string
 	nextSeq             int64
 	saveInboundInserted bool
 	outboundReplay      []Frame
 	inboundReplay       []Frame
 	markSentErr         error
+	lastOutbound        Frame
 }
 
 func newSpyStore() *spyStore {
@@ -332,31 +310,63 @@ func newSpyStore() *spyStore {
 }
 
 func (s *spyStore) record(call string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls = append(s.calls, call)
+}
+
+func (s *spyStore) resetCalls() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = nil
+}
+
+func (s *spyStore) callSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+func (s *spyStore) callsEqual(want []string) bool {
+	return reflect.DeepEqual(want, s.callSnapshot())
+}
+
+func (s *spyStore) lastOutboundFrame() Frame {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastOutbound.Clone()
 }
 
 func (s *spyStore) AppendOutboundData(ctx context.Context, queueID string, stream Stream, payload json.RawMessage, metadata Metadata) (Frame, error) {
 	s.record("AppendOutboundData")
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.nextSeq++
-	return Frame{
+	frame := Frame{
 		Key:      FrameKey{QueueID: queueID, Stream: stream, Seq: s.nextSeq, Direction: DirectionOutbound},
 		Kind:     FrameKindData,
 		Payload:  append(json.RawMessage(nil), payload...),
 		Metadata: metadata.Clone(),
 		Status:   StatusPending,
-	}, nil
+	}
+	s.lastOutbound = frame.Clone()
+	return frame, nil
 }
 
 func (s *spyStore) AppendOutboundTombstone(ctx context.Context, queueID string, stream Stream, errorMessage string, metadata Metadata) (Frame, error) {
 	s.record("AppendOutboundTombstone")
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.nextSeq++
-	return Frame{
+	frame := Frame{
 		Key:          FrameKey{QueueID: queueID, Stream: stream, Seq: s.nextSeq, Direction: DirectionOutbound},
 		Kind:         FrameKindTombstone,
 		Metadata:     metadata.Clone(),
 		Status:       StatusPending,
 		ErrorMessage: errorMessage,
-	}, nil
+	}
+	s.lastOutbound = frame.Clone()
+	return frame, nil
 }
 
 func (s *spyStore) SaveInboundIfAbsent(ctx context.Context, frame Frame) (bool, Frame, error) {

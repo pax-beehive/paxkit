@@ -264,10 +264,12 @@ func TestConsumerWriteBehindStoreBackgroundWorkerFlushesInbound(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		return len(sink.calls) > 0
+		return len(sink.batchCalls()) > 0
 	}, time.Second, time.Millisecond)
 	assert.Equal(t, 0, store.Stats().DirtyFrames)
-	assert.Equal(t, time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC), sink.batches[0].Frames[0].CreatedAt)
+	batches := sink.batchCalls()
+	require.NotEmpty(t, batches)
+	assert.Equal(t, time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC), batches[0].Frames[0].CreatedAt)
 }
 
 func TestConsumerWriteBehindStoreRejectsInvalidOrClosedInbound(t *testing.T) {
@@ -527,6 +529,16 @@ func (s *consumerWriteBehindSink) ApplyBatch(ctx context.Context, batch StoreBat
 	}
 	s.batches = append(s.batches, cloneStoreBatch(batch))
 	return nil
+}
+
+func (s *consumerWriteBehindSink) batchCalls() []StoreBatch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batches := make([]StoreBatch, 0, len(s.batches))
+	for _, batch := range s.batches {
+		batches = append(batches, cloneStoreBatch(batch))
+	}
+	return batches
 }
 
 func (s *consumerWriteBehindSink) ListInboundReplay(

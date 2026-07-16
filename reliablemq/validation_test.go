@@ -120,16 +120,13 @@ func TestEngineConfigurationErrors(t *testing.T) {
 	}{
 		{name: "nil engine", run: func() error {
 			var engine *Engine
-			_, err := engine.Send(context.Background(), OutboundMessage{})
-			return err
+			return engine.Send(context.Background(), OutboundMessage{})
 		}},
 		{name: "missing store", run: func() error {
-			_, err := NewEngine(Config{}, nil, newSpySender(nil), nil).Send(context.Background(), OutboundMessage{QueueID: "conn_1", Stream: StreamACP, Payload: json.RawMessage(`{}`)})
-			return err
+			return NewEngine(Config{}, nil, &Producer{}, nil).Send(context.Background(), OutboundMessage{QueueID: "conn_1", Stream: StreamACP, Payload: json.RawMessage(`{}`)})
 		}},
-		{name: "missing sender", run: func() error {
-			_, err := NewEngine(Config{}, store, nil, nil).Send(context.Background(), OutboundMessage{QueueID: "conn_1", Stream: StreamACP, Payload: json.RawMessage(`{}`)})
-			return err
+		{name: "missing producer", run: func() error {
+			return NewEngine(Config{}, store, nil, nil).Send(context.Background(), OutboundMessage{QueueID: "conn_1", Stream: StreamACP, Payload: json.RawMessage(`{}`)})
 		}},
 		{name: "missing dispatcher", run: func() error {
 			return NewEngine(Config{}, store, nil, nil).ReplayInbound(context.Background(), "conn_1", StreamACP, 1)
