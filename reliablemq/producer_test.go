@@ -262,6 +262,74 @@ func TestProducerHeadFailurePreventsLaterFrameBypass(t *testing.T) {
 	assert.Equal(t, []int64{1, 2}, recovered.dataSeqs())
 }
 
+func TestProducerBindingReportsRuntimeWriterFailure(t *testing.T) {
+	// Given
+	sink := newProducerWriteBehindSink()
+	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
+	defer closeProducerWriteBehindStore(t, store)
+	producer := newTestProducer(t, store)
+	defer closeProducer(t, producer)
+	sender := newRecordingEnvelopeSender()
+	sender.failSeq = 1
+	binding, err := producer.Bind(context.Background(), sender, 0)
+	require.NoError(t, err)
+	defer binding.Close()
+	require.NoError(t, binding.WaitCaughtUp(context.Background()))
+	engine := NewEngine(Config{}, store, producer, nil)
+
+	// When
+	require.NoError(t, engine.Send(context.Background(), outboundMessage(1)))
+
+	// Then
+	select {
+	case <-binding.Done():
+	case <-time.After(time.Second):
+		t.Fatal("binding did not report its runtime writer failure")
+	}
+	require.ErrorIs(t, binding.Err(), ErrProducerDisconnected)
+	require.ErrorContains(t, binding.Err(), "socket failed")
+	assert.False(t, producer.Stats().Bound)
+}
+
+func TestProducerBindingReportsRuntimeCursorFailure(t *testing.T) {
+	// Given
+	sink := newProducerWriteBehindSink()
+	sink.queueState = QueueState{NextOutboundSeq: 3}
+	sink.outboundReplay = []Frame{
+		outboundProducerFrame(1, StatusPending),
+		outboundProducerFrame(2, StatusPending),
+	}
+	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
+	defer closeProducerWriteBehindStore(t, store)
+	producer := newTestProducerWithConfig(t, store, ProducerConfig{CursorBatchSize: 1})
+	defer closeProducer(t, producer)
+	sender := newBlockingFirstEnvelopeSender()
+	binding, err := producer.Bind(context.Background(), sender, 0)
+	require.NoError(t, err)
+	defer binding.Close()
+	select {
+	case <-sender.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not start the first cursor frame")
+	}
+
+	// When
+	sink.mu.Lock()
+	sink.outboundReplay = sink.outboundReplay[:1]
+	sink.mu.Unlock()
+	close(sender.release)
+
+	// Then
+	select {
+	case <-binding.Done():
+	case <-time.After(time.Second):
+		t.Fatal("binding did not report its runtime cursor failure")
+	}
+	require.ErrorIs(t, binding.Err(), ErrProducerDisconnected)
+	require.ErrorIs(t, binding.Err(), ErrProducerJournalGap)
+	assert.Equal(t, []int64{1}, sender.dataSeqs())
+}
+
 func TestProducerPersistsCumulativeACKWithoutMarkSentPatch(t *testing.T) {
 	// Given
 	sink := newProducerWriteBehindSink()

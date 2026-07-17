@@ -83,7 +83,15 @@ type ProducerBinding struct {
 	producer   *Producer
 	generation uint64
 	targetTail int64
+	lifecycle  *producerBindingLifecycle
 	once       sync.Once
+}
+
+type producerBindingLifecycle struct {
+	done chan struct{}
+	once sync.Once
+	mu   sync.RWMutex
+	err  error
 }
 
 type acceptedOutbound struct {
@@ -123,6 +131,7 @@ type producerWriterBinding struct {
 	generation uint64
 	requests   chan producerWriteRequest
 	cancel     context.CancelFunc
+	lifecycle  *producerBindingLifecycle
 }
 
 type producerWriteKind uint8
@@ -526,6 +535,23 @@ func (b *ProducerBinding) Close() {
 	})
 }
 
+// Done is closed when this generation is no longer bound to its sender.
+func (b *ProducerBinding) Done() <-chan struct{} {
+	if b == nil || b.lifecycle == nil {
+		return nil
+	}
+	return b.lifecycle.done
+}
+
+// Err reports why this binding generation ended. It returns nil while the
+// binding is active or when it was closed without a transport failure.
+func (b *ProducerBinding) Err() error {
+	if b == nil || b.lifecycle == nil {
+		return ErrProducerDisconnected
+	}
+	return b.lifecycle.loadError()
+}
+
 func (b *ProducerBinding) WaitCaughtUp(ctx context.Context) error {
 	if b == nil || b.producer == nil {
 		return ErrProducerDisconnected
@@ -538,7 +564,7 @@ func (b *ProducerBinding) WaitCaughtUp(ctx context.Context) error {
 	for {
 		stats := b.producer.Stats()
 		if stats.BindingGeneration != b.generation || !stats.Bound {
-			return ErrProducerDisconnected
+			return b.disconnectedError()
 		}
 		if stats.NextToSend > b.targetTail {
 			return nil
@@ -548,10 +574,44 @@ func (b *ProducerBinding) WaitCaughtUp(ctx context.Context) error {
 			return ctx.Err()
 		case <-b.producer.done:
 			return ErrProducerClosed
+		case <-b.Done():
+			return b.disconnectedError()
 		case <-b.producer.progress:
 		case <-ticker.C:
 		}
 	}
+}
+
+func (b *ProducerBinding) disconnectedError() error {
+	if err := b.Err(); err != nil {
+		return err
+	}
+	return ErrProducerDisconnected
+}
+
+func newProducerBindingLifecycle() *producerBindingLifecycle {
+	return &producerBindingLifecycle{done: make(chan struct{})}
+}
+
+func (l *producerBindingLifecycle) finish(err error) {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		l.mu.Lock()
+		l.err = err
+		l.mu.Unlock()
+		close(l.done)
+	})
+}
+
+func (l *producerBindingLifecycle) loadError() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.err
 }
 
 func (p *Producer) run(ctx context.Context, state producerOwnerState) {
@@ -568,7 +628,7 @@ func (p *Producer) run(ctx context.Context, state producerOwnerState) {
 
 		if p.state.Load() == producerStateClosing &&
 			p.accepting.Load() == 0 && p.ingress.Empty() {
-			p.disableBinding(&state)
+			p.disableBinding(&state, ErrProducerClosed)
 			p.state.Store(producerStateClosed)
 			p.cancel()
 			p.signalProgress()
@@ -577,7 +637,7 @@ func (p *Producer) run(ctx context.Context, state producerOwnerState) {
 
 		select {
 		case <-ctx.Done():
-			p.disableBinding(&state)
+			p.disableBinding(&state, errors.Join(ErrProducerClosed, ctx.Err()))
 			p.state.Store(producerStateClosed)
 			return
 		case <-p.wake:
@@ -907,13 +967,15 @@ func (p *Producer) handleCommand(ctx context.Context, state *producerOwnerState,
 				return
 			}
 		}
-		p.disableBinding(state)
+		p.disableBinding(state, nil)
 		state.nextGeneration++
 		writerCtx, cancel := context.WithCancel(ctx)
+		lifecycle := newProducerBindingLifecycle()
 		bindingState := &producerWriterBinding{
 			generation: state.nextGeneration,
 			requests:   make(chan producerWriteRequest, 1),
 			cancel:     cancel,
+			lifecycle:  lifecycle,
 		}
 		state.binding = bindingState
 		state.networkInFlight = false
@@ -925,6 +987,7 @@ func (p *Producer) handleCommand(ctx context.Context, state *producerOwnerState,
 			producer:   p,
 			generation: bindingState.generation,
 			targetTail: state.tail,
+			lifecycle:  lifecycle,
 		}
 		command.response <- producerBindResult{binding: binding}
 		p.signalProgress()
@@ -983,7 +1046,7 @@ func (p *Producer) handleCommand(ctx context.Context, state *producerOwnerState,
 		command.response <- nil
 	case producerUnbindCommand:
 		if state.binding != nil && state.binding.generation == command.generation {
-			p.disableBinding(state)
+			p.disableBinding(state, nil)
 			p.signalProgress()
 		}
 	}
@@ -1015,13 +1078,14 @@ func (p *Producer) runWriter(
 
 func (p *Producer) disconnect(state *producerOwnerState, err error) {
 	p.lastError.Store(producerErrorValue{err: err})
-	p.disableBinding(state)
+	p.disableBinding(state, errors.Join(ErrProducerDisconnected, err))
 	p.signalProgress()
 }
 
-func (p *Producer) disableBinding(state *producerOwnerState) {
+func (p *Producer) disableBinding(state *producerOwnerState, err error) {
 	if state.binding != nil {
 		state.binding.cancel()
+		state.binding.lifecycle.finish(err)
 		state.binding = nil
 	}
 	state.networkInFlight = false
@@ -1040,7 +1104,7 @@ func (p *Producer) fail(state *producerOwnerState, err error) {
 		return
 	}
 	p.lastError.Store(producerErrorValue{err: err})
-	p.disableBinding(state)
+	p.disableBinding(state, errors.Join(ErrProducerDisconnected, err))
 	p.signalProgress()
 	if p.config.OnError != nil {
 		p.config.OnError(err)
