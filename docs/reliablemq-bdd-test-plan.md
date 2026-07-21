@@ -294,6 +294,39 @@ Expected:
 - no ACK response sent
 - no dispatcher
 
+#### Given cumulative ACKs advance repeatedly, when write-behind flushes, then only the highest ACK is persisted per queue
+
+Expected:
+
+- duplicate and out-of-order ACKs do not create additional journal patches
+- one flush contains at most one cumulative ACK per `queue_id + stream`
+- the persisted ACK watermark advances monotonically
+
+#### Given old outbound frames are already ACKed, when a newer cumulative ACK arrives, then old rows are not rewritten
+
+Expected:
+
+- only rows in `(old_acked_through, new_acked_through]` transition to ACKed
+- old ACKed rows keep their original `updated_at`
+- a duplicate or lower ACK performs no frame updates
+
+#### Given a journal with thousands of ACKed rows, when ACK advances by one, then exactly the new row is updated
+
+Expected:
+
+- historical row count does not affect the number of updated frame rows
+- restart reloads the durable ACK watermark before accepting another ACK
+- upgrading an existing queue-state table backfills the watermark from ACKed history
+- an invalid ACK beyond the current outbound tail is capped at the durable tail
+
+#### Given one durable batch contains several ACKed frames or patches, when ApplyBatch commits, then each queue watermark advances once
+
+Expected:
+
+- frame inserts and ACK advancement remain in the same transaction
+- each `queue_id + stream` contributes only its maximum `through_seq`
+- batch cost is not multiplied by the number of cumulative ACK observations
+
 ### Replay
 
 #### Given more frames than one cursor page, when a producer binds after reconnect, then every replayable frame is sent in seq order
@@ -369,6 +402,18 @@ Expected:
 
 - outbound replay includes pending/sent only
 - inbound replay includes received only
+
+### Retention
+
+#### Given ACKed outbound history exceeds both retention windows, when pruning runs, then only old rows outside the debug tail are deleted
+
+Expected:
+
+- ACK processing itself never deletes journal rows
+- rows newer than the time cutoff are retained
+- at least the latest configured sequence window per queue is retained
+- pending/sent outbound rows and all inbound rows are retained
+- one prune call deletes no more than its configured batch limit
 
 ## Implementation Gate
 

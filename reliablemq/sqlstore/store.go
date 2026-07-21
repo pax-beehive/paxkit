@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,6 +22,16 @@ type Option func(*config)
 
 type config struct {
 	TableName string
+}
+
+type AckedOutboundPruneOptions struct {
+	OlderThan          time.Time
+	KeepLatestPerQueue int64
+	Limit              int
+}
+
+type PruneResult struct {
+	Deleted int64
 }
 
 func WithTableName(tableName string) Option {
@@ -88,6 +99,7 @@ func (sqliteDialect) createQueueStateTableSQL(table string) string {
 				queue_id TEXT NOT NULL,
 				stream TEXT NOT NULL,
 				next_outbound_seq INTEGER NOT NULL DEFAULT 1,
+				outbound_acked_through INTEGER NOT NULL DEFAULT 0,
 				inbound_applied_through INTEGER NOT NULL DEFAULT 0,
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL,
@@ -138,6 +150,7 @@ func (postgresDialect) createQueueStateTableSQL(table string) string {
 				queue_id TEXT NOT NULL,
 				stream TEXT NOT NULL,
 				next_outbound_seq BIGINT NOT NULL DEFAULT 1,
+				outbound_acked_through BIGINT NOT NULL DEFAULT 0,
 				inbound_applied_through BIGINT NOT NULL DEFAULT 0,
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL,
@@ -332,10 +345,14 @@ func (s *Store) LoadQueueState(
 	b := s.dialect.bind
 	var state reliablemq.QueueState
 	err = tx.QueryRowContext(ctx, `
-		SELECT next_outbound_seq, inbound_applied_through
+		SELECT next_outbound_seq, outbound_acked_through, inbound_applied_through
 		FROM `+s.queueStateTableName+`
 		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+`
-	`, queueID, string(stream)).Scan(&state.NextOutboundSeq, &state.InboundAppliedThrough)
+	`, queueID, string(stream)).Scan(
+		&state.NextOutboundSeq,
+		&state.OutboundAckedThrough,
+		&state.InboundAppliedThrough,
+	)
 	if err != nil {
 		return reliablemq.QueueState{}, err
 	}
@@ -438,6 +455,51 @@ func (s *Store) ConsumerAckedThrough(
 	return through, nil
 }
 
+// PruneAckedOutbound deletes one bounded batch of ACKed outbound history that
+// is older than the time cutoff and outside each queue's retained debug tail.
+// It is intentionally separate from AckOutboundThrough so ACK latency never
+// includes retention work.
+func (s *Store) PruneAckedOutbound(
+	ctx context.Context,
+	options AckedOutboundPruneOptions,
+) (PruneResult, error) {
+	if options.OlderThan.IsZero() {
+		return PruneResult{}, fmt.Errorf("sqlstore: prune older-than cutoff is required")
+	}
+	if options.KeepLatestPerQueue < 0 {
+		return PruneResult{}, fmt.Errorf("sqlstore: prune keep-latest must be non-negative")
+	}
+	if options.Limit <= 0 {
+		return PruneResult{}, fmt.Errorf("sqlstore: prune limit must be positive")
+	}
+	b := s.dialect.bind
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM `+s.tableName+`
+		WHERE id IN (
+			SELECT frame.id
+			FROM `+s.tableName+` AS frame
+			JOIN `+s.queueStateTableName+` AS queue_state
+				ON queue_state.queue_id = frame.queue_id
+				AND queue_state.stream = frame.stream
+			WHERE frame.direction = `+b(1)+`
+				AND frame.status = `+b(2)+`
+				AND frame.updated_at < `+b(3)+`
+				AND frame.seq <= queue_state.outbound_acked_through - `+b(4)+`
+			ORDER BY frame.updated_at, frame.id
+			LIMIT `+b(5)+`
+		)
+	`, string(reliablemq.DirectionOutbound), string(reliablemq.StatusAcked),
+		formatTime(options.OlderThan.UTC()), options.KeepLatestPerQueue, options.Limit)
+	if err != nil {
+		return PruneResult{}, err
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return PruneResult{}, err
+	}
+	return PruneResult{Deleted: deleted}, nil
+}
+
 func (s *Store) ApplyBatch(ctx context.Context, batch reliablemq.StoreBatch) error {
 	if len(batch.Frames) == 0 && len(batch.Patches) == 0 {
 		return nil
@@ -447,6 +509,7 @@ func (s *Store) ApplyBatch(ctx context.Context, batch reliablemq.StoreBatch) err
 		return err
 	}
 	defer rollback(tx)
+	ackThrough := make(map[batchAckKey]int64)
 	for _, frame := range batch.Frames {
 		if err := reliablemq.ValidateFrame(frame); err != nil {
 			return err
@@ -478,13 +541,46 @@ func (s *Store) ApplyBatch(ctx context.Context, batch reliablemq.StoreBatch) err
 				return err
 			}
 		}
+		if frame.Status == reliablemq.StatusAcked {
+			coalesceBatchAck(ackThrough, frame.Key)
+		}
 	}
 	for _, patch := range batch.Patches {
 		if err := s.applyPatchTx(ctx, tx, patch); err != nil {
 			return err
 		}
+		if patch.Status == reliablemq.StatusAcked {
+			coalesceBatchAck(ackThrough, patch.Key)
+		}
+	}
+	ackKeys := make([]batchAckKey, 0, len(ackThrough))
+	for key := range ackThrough {
+		ackKeys = append(ackKeys, key)
+	}
+	sort.Slice(ackKeys, func(i, j int) bool {
+		if ackKeys[i].queueID != ackKeys[j].queueID {
+			return ackKeys[i].queueID < ackKeys[j].queueID
+		}
+		return ackKeys[i].stream < ackKeys[j].stream
+	})
+	for _, key := range ackKeys {
+		if err := s.ackOutboundThroughTx(ctx, tx, key.queueID, key.stream, ackThrough[key]); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
+}
+
+type batchAckKey struct {
+	queueID string
+	stream  reliablemq.Stream
+}
+
+func coalesceBatchAck(acks map[batchAckKey]int64, key reliablemq.FrameKey) {
+	ackKey := batchAckKey{queueID: key.QueueID, stream: key.Stream}
+	if key.Seq > acks[ackKey] {
+		acks[ackKey] = key.Seq
+	}
 }
 
 func (s *Store) MarkSent(ctx context.Context, key reliablemq.FrameKey) error {
@@ -587,10 +683,56 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, s.dialect.createQueueStateTableSQL(s.queueStateTableName)); err != nil {
 		return err
 	}
+	if err := s.migrateQueueState(ctx); err != nil {
+		return err
+	}
 	if err := s.validateSchema(ctx); err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, s.dialect.createReplayIndexSQL(s.tableName))
+	if _, err = s.db.ExecContext(ctx, s.dialect.createReplayIndexSQL(s.tableName)); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS `+s.tableName+`_cleanup_idx
+		ON `+s.tableName+` (status, updated_at)
+	`)
+	return err
+}
+
+func (s *Store) migrateQueueState(ctx context.Context) error {
+	if s.dialect.name() == dialectPostgres {
+		if _, err := s.db.ExecContext(ctx, `
+			ALTER TABLE `+s.queueStateTableName+`
+			ADD COLUMN IF NOT EXISTS outbound_acked_through BIGINT NOT NULL DEFAULT 0
+		`); err != nil {
+			return err
+		}
+	} else {
+		columns, err := s.sqliteColumnsFor(ctx, s.queueStateTableName)
+		if err != nil {
+			return err
+		}
+		if _, ok := columns["outbound_acked_through"]; !ok {
+			if _, err := s.db.ExecContext(ctx, `
+				ALTER TABLE `+s.queueStateTableName+`
+				ADD COLUMN outbound_acked_through INTEGER NOT NULL DEFAULT 0
+			`); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE `+s.queueStateTableName+`
+		SET outbound_acked_through = COALESCE((
+			SELECT MAX(frame.seq)
+			FROM `+s.tableName+` AS frame
+			WHERE frame.queue_id = `+s.queueStateTableName+`.queue_id
+				AND frame.stream = `+s.queueStateTableName+`.stream
+				AND frame.direction = 'outbound'
+				AND frame.status = 'acked'
+		), 0)
+		WHERE outbound_acked_through = 0
+	`)
 	return err
 }
 
@@ -638,7 +780,11 @@ type schemaColumn struct {
 }
 
 func (s *Store) sqliteColumns(ctx context.Context) (map[string]schemaColumn, error) {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+s.tableName+`)`)
+	return s.sqliteColumnsFor(ctx, s.tableName)
+}
+
+func (s *Store) sqliteColumnsFor(ctx context.Context, tableName string) (map[string]schemaColumn, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+tableName+`)`)
 	if err != nil {
 		return nil, err
 	}
@@ -934,13 +1080,17 @@ func (s *Store) ensureQueueStateTx(
 	b := s.dialect.bind
 	_, err := tx.ExecContext(ctx, `
 		`+s.dialect.insertIgnorePrefix()+` INTO `+s.queueStateTableName+` (
-			queue_id, stream, next_outbound_seq, inbound_applied_through, created_at, updated_at
+			queue_id, stream, next_outbound_seq, outbound_acked_through,
+			inbound_applied_through, created_at, updated_at
 		)
-		SELECT `+b(1)+`, `+b(2)+`, COALESCE(MAX(seq), 0) + 1, 0, `+b(3)+`, `+b(4)+`
+		SELECT `+b(1)+`, `+b(2)+`, COALESCE(MAX(seq), 0) + 1,
+			COALESCE(MAX(CASE WHEN status = `+b(3)+` THEN seq END), 0),
+			0, `+b(4)+`, `+b(5)+`
 		FROM `+s.tableName+`
-		WHERE queue_id = `+b(5)+` AND stream = `+b(6)+` AND direction = `+b(7)+`
+		WHERE queue_id = `+b(6)+` AND stream = `+b(7)+` AND direction = `+b(8)+`
 		`+queueStateInsertIgnoreSuffix(s.dialect)+`
-	`, queueID, string(stream), now, now, queueID, string(stream), string(reliablemq.DirectionOutbound))
+	`, queueID, string(stream), string(reliablemq.StatusAcked), now, now,
+		queueID, string(stream), string(reliablemq.DirectionOutbound))
 	return err
 }
 
@@ -1140,9 +1290,7 @@ func (s *Store) applyPatchTx(ctx context.Context, tx *sql.Tx, patch reliablemq.S
 			return err
 		}
 	case reliablemq.StatusAcked:
-		if err := s.ackOutboundThroughTx(ctx, tx, patch.Key.QueueID, patch.Key.Stream, patch.Key.Seq); err != nil {
-			return err
-		}
+		// ApplyBatch coalesces cumulative ACKs and advances each queue once.
 	case reliablemq.StatusApplied:
 		if err := s.updateStatusTx(ctx, tx, patch.Key, reliablemq.StatusApplied, ""); err != nil {
 			return err
@@ -1194,9 +1342,7 @@ func (s *Store) applyFrameStateTx(ctx context.Context, tx *sql.Tx, frame reliabl
 			return err
 		}
 	case reliablemq.StatusAcked:
-		if err := s.ackOutboundThroughTx(ctx, tx, frame.Key.QueueID, frame.Key.Stream, frame.Key.Seq); err != nil {
-			return err
-		}
+		// ApplyBatch coalesces cumulative ACKs and advances each queue once.
 	case reliablemq.StatusApplied:
 		if err := s.updateStatusTx(ctx, tx, frame.Key, reliablemq.StatusApplied, ""); err != nil {
 			return err
@@ -1221,14 +1367,44 @@ func (s *Store) ackOutboundThroughTx(
 	stream reliablemq.Stream,
 	throughSeq int64,
 ) error {
-	now := formatTime(time.Now().UTC())
+	if err := s.ensureQueueStateTx(ctx, tx, queueID, stream); err != nil {
+		return err
+	}
 	b := s.dialect.bind
-	_, err := tx.ExecContext(ctx, `
+	var oldThrough int64
+	var nextOutboundSeq int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT outbound_acked_through, next_outbound_seq
+		FROM `+s.queueStateTableName+`
+		WHERE queue_id = `+b(1)+` AND stream = `+b(2)+s.dialect.selectForUpdateSuffix()+`
+	`, queueID, string(stream)).Scan(&oldThrough, &nextOutboundSeq); err != nil {
+		return err
+	}
+	durableTail := nextOutboundSeq - 1
+	if throughSeq > durableTail {
+		throughSeq = durableTail
+	}
+	if throughSeq <= oldThrough {
+		return nil
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE `+s.tableName+`
 		SET status = `+b(1)+`, error_message = '', updated_at = `+b(2)+`
 		WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
-			AND direction = `+b(5)+` AND seq <= `+b(6)+`
-	`, string(reliablemq.StatusAcked), now, queueID, string(stream), string(reliablemq.DirectionOutbound), throughSeq)
+			AND direction = `+b(5)+`
+			AND status IN (`+b(6)+`, `+b(7)+`)
+			AND seq > `+b(8)+` AND seq <= `+b(9)+`
+	`, string(reliablemq.StatusAcked), now, queueID, string(stream),
+		string(reliablemq.DirectionOutbound), string(reliablemq.StatusPending),
+		string(reliablemq.StatusSent), oldThrough, throughSeq); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `
+		UPDATE `+s.queueStateTableName+`
+		SET outbound_acked_through = `+b(1)+`, updated_at = `+b(2)+`
+		WHERE queue_id = `+b(3)+` AND stream = `+b(4)+`
+	`, throughSeq, now, queueID, string(stream))
 	return err
 }
 

@@ -90,6 +90,7 @@ type ProducerWriteBehindStore struct {
 	frames       map[FrameKey]Frame
 	dirtyFrames  map[FrameKey]Frame
 	dirtyPatches map[FrameKey]StorePatch
+	dirtyAcks    map[producerQueueKey]int64
 	closed       bool
 	stats        ProducerWriteBehindStats
 	retryAt      time.Time
@@ -107,6 +108,7 @@ type producerQueueKey struct {
 type producerQueueState struct {
 	nextOutboundSeq  int64
 	persistedThrough int64
+	ackedThrough     int64
 	loaded           bool
 }
 
@@ -133,6 +135,7 @@ func NewProducerWriteBehindStore(
 		frames:       make(map[FrameKey]Frame),
 		dirtyFrames:  make(map[FrameKey]Frame),
 		dirtyPatches: make(map[FrameKey]StorePatch),
+		dirtyAcks:    make(map[producerQueueKey]int64),
 		notify:       make(chan struct{}, 1),
 		done:         make(chan struct{}),
 	}
@@ -347,32 +350,7 @@ func (s *ProducerWriteBehindStore) AdvanceProducerNextSeq(
 		state.loaded = true
 		s.queues[key] = state
 	}
-	throughSeq := nextSeq - 1
-	now := s.config.Now().UTC()
-	for frameKey, frame := range s.frames {
-		if frameKey.QueueID != queueID ||
-			frameKey.Stream != stream ||
-			frameKey.Direction != DirectionOutbound ||
-			frameKey.Seq > throughSeq {
-			continue
-		}
-		frame.Status = StatusAcked
-		frame.ErrorMessage = ""
-		frame.UpdatedAt = now
-		s.frames[frameKey] = frame.Clone()
-		if _, dirty := s.dirtyFrames[frameKey]; dirty {
-			s.dirtyFrames[frameKey] = frame.Clone()
-		}
-	}
-	patchKey := FrameKey{
-		QueueID:   queueID,
-		Stream:    stream,
-		Seq:       throughSeq,
-		Direction: DirectionOutbound,
-	}
-	if throughSeq > 0 {
-		s.dirtyPatches[patchKey] = StorePatch{Key: patchKey, Status: StatusAcked}
-	}
+	s.ackOutboundThroughLocked(queueID, stream, nextSeq-1)
 	s.updateDirtyStatsLocked()
 	s.notifyFlushLocked()
 	return nil
@@ -398,11 +376,38 @@ func (s *ProducerWriteBehindStore) AckOutboundThrough(
 	if s.closed {
 		return ErrProducerStoreClosed
 	}
+	key := producerQueueKey{queueID: queueID, stream: stream}
+	state, err := s.queueStateLocked(ctx, queueID, stream)
+	if err != nil {
+		return err
+	}
+	s.queues[key] = state
+	s.ackOutboundThroughLocked(queueID, stream, throughSeq)
+	s.updateDirtyStatsLocked()
+	s.notifyFlushLocked()
+	return nil
+}
+
+func (s *ProducerWriteBehindStore) ackOutboundThroughLocked(
+	queueID string,
+	stream Stream,
+	throughSeq int64,
+) {
+	queueKey := producerQueueKey{queueID: queueID, stream: stream}
+	state := s.queues[queueKey]
+	if throughSeq <= state.ackedThrough {
+		return
+	}
+	oldThrough := state.ackedThrough
+	state.ackedThrough = throughSeq
+	s.queues[queueKey] = state
+
 	now := s.config.Now().UTC()
 	for key, frame := range s.frames {
 		if key.QueueID != queueID ||
 			key.Stream != stream ||
 			key.Direction != DirectionOutbound ||
+			key.Seq <= oldThrough ||
 			key.Seq > throughSeq {
 			continue
 		}
@@ -414,16 +419,9 @@ func (s *ProducerWriteBehindStore) AckOutboundThrough(
 			s.dirtyFrames[key] = frame.Clone()
 		}
 	}
-	patchKey := FrameKey{
-		QueueID:   queueID,
-		Stream:    stream,
-		Seq:       throughSeq,
-		Direction: DirectionOutbound,
+	if throughSeq > s.dirtyAcks[queueKey] {
+		s.dirtyAcks[queueKey] = throughSeq
 	}
-	s.dirtyPatches[patchKey] = StorePatch{Key: patchKey, Status: StatusAcked}
-	s.updateDirtyStatsLocked()
-	s.notifyFlushLocked()
-	return nil
 }
 
 func (s *ProducerWriteBehindStore) MarkApplied(ctx context.Context, key FrameKey) error {
@@ -577,6 +575,7 @@ func (s *ProducerWriteBehindStore) queueStateLocked(
 		if loaded.NextOutboundSeq > 0 {
 			state.nextOutboundSeq = loaded.NextOutboundSeq
 		}
+		state.ackedThrough = loaded.OutboundAckedThrough
 	}
 	state.persistedThrough = state.nextOutboundSeq - 1
 	state.loaded = true
@@ -668,14 +667,34 @@ func (s *ProducerWriteBehindStore) flushWhenReady(ctx context.Context) {
 type producerWriteBehindSnapshot struct {
 	frames  []Frame
 	patches []StorePatch
+	acks    []producerOutboundAck
+}
+
+type producerOutboundAck struct {
+	queueID    string
+	stream     Stream
+	throughSeq int64
 }
 
 func (s producerWriteBehindSnapshot) empty() bool {
-	return len(s.frames) == 0 && len(s.patches) == 0
+	return len(s.frames) == 0 && len(s.patches) == 0 && len(s.acks) == 0
 }
 
 func (s producerWriteBehindSnapshot) batch() StoreBatch {
-	return StoreBatch{Frames: s.frames, Patches: s.patches}
+	patches := make([]StorePatch, 0, len(s.patches)+len(s.acks))
+	patches = append(patches, s.patches...)
+	for _, ack := range s.acks {
+		patches = append(patches, StorePatch{
+			Key: FrameKey{
+				QueueID:   ack.queueID,
+				Stream:    ack.stream,
+				Seq:       ack.throughSeq,
+				Direction: DirectionOutbound,
+			},
+			Status: StatusAcked,
+		})
+	}
+	return StoreBatch{Frames: s.frames, Patches: patches}
 }
 
 func (s *ProducerWriteBehindStore) snapshot() producerWriteBehindSnapshot {
@@ -696,10 +715,21 @@ func (s *ProducerWriteBehindStore) snapshot() producerWriteBehindSnapshot {
 	sort.Slice(patches, func(i, j int) bool {
 		return patches[i].Key.Seq < patches[j].Key.Seq
 	})
+	acks := make([]producerOutboundAck, 0, len(s.dirtyAcks))
+	for key, throughSeq := range s.dirtyAcks {
+		acks = append(acks, producerOutboundAck{queueID: key.queueID, stream: key.stream, throughSeq: throughSeq})
+	}
+	sort.Slice(acks, func(i, j int) bool {
+		if acks[i].queueID != acks[j].queueID {
+			return acks[i].queueID < acks[j].queueID
+		}
+		return acks[i].stream < acks[j].stream
+	})
 	s.dirtyFrames = make(map[FrameKey]Frame)
 	s.dirtyPatches = make(map[FrameKey]StorePatch)
+	s.dirtyAcks = make(map[producerQueueKey]int64)
 	s.updateDirtyStatsLocked()
-	return producerWriteBehindSnapshot{frames: frames, patches: patches}
+	return producerWriteBehindSnapshot{frames: frames, patches: patches, acks: acks}
 }
 
 func (s *ProducerWriteBehindStore) flushSnapshot(
@@ -719,6 +749,11 @@ func (s *ProducerWriteBehindStore) flushSnapshot(
 	}
 	for _, patch := range snapshot.patches {
 		if err := s.flushPatch(ctx, patch); err != nil {
+			return err
+		}
+	}
+	for _, ack := range snapshot.acks {
+		if err := s.sink.AckOutboundThrough(ctx, ack.queueID, ack.stream, ack.throughSeq); err != nil {
 			return err
 		}
 	}
@@ -811,6 +846,12 @@ func (s *ProducerWriteBehindStore) recordFlushFailure(
 			s.dirtyPatches[patch.Key] = patch
 		}
 	}
+	for _, ack := range snapshot.acks {
+		key := producerQueueKey{queueID: ack.queueID, stream: ack.stream}
+		if ack.throughSeq > s.dirtyAcks[key] {
+			s.dirtyAcks[key] = ack.throughSeq
+		}
+	}
 	s.stats.Degraded = true
 	s.stats.ConsecutiveFlushFailures++
 	s.stats.LastFlushError = err.Error()
@@ -869,7 +910,7 @@ func (s *ProducerWriteBehindStore) nextRetryDelayLocked() time.Duration {
 
 func (s *ProducerWriteBehindStore) updateDirtyStatsLocked() {
 	s.stats.DirtyFrames = len(s.dirtyFrames)
-	s.stats.DirtyPatches = len(s.dirtyPatches)
+	s.stats.DirtyPatches = len(s.dirtyPatches) + len(s.dirtyAcks)
 	var bytes int64
 	for _, frame := range s.dirtyFrames {
 		bytes += int64(len(frame.Payload) + len(frame.ErrorMessage))
