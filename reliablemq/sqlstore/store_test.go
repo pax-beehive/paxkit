@@ -3,6 +3,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -350,6 +351,168 @@ func TestAckOutboundThrough(t *testing.T) {
 	require.Equal(t, reliablemq.StatusPending, mustGet(t, store, otherQueue.Key).Status)
 }
 
+func TestAckOutboundThroughOnlyUpdatesNewlyAckedRange(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	first, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+	require.NoError(t, err)
+	second, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+	require.NoError(t, err)
+	third, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+	require.NoError(t, err)
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, second.Key.Seq))
+	firstAckedAt := mustGet(t, store, first.Key).UpdatedAt
+	secondAckedAt := mustGet(t, store, second.Key).UpdatedAt
+	time.Sleep(time.Millisecond)
+
+	// When
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, third.Key.Seq))
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, second.Key.Seq))
+
+	// Then
+	require.Equal(t, firstAckedAt, mustGet(t, store, first.Key).UpdatedAt)
+	require.Equal(t, secondAckedAt, mustGet(t, store, second.Key).UpdatedAt)
+	require.Equal(t, reliablemq.StatusAcked, mustGet(t, store, third.Key).Status)
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), state.OutboundAckedThrough)
+}
+
+func TestAckWatermarkSurvivesRestart(t *testing.T) {
+	// Given
+	path := filepath.Join(t.TempDir(), "transport.db")
+	db, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	first, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+	require.NoError(t, err)
+	second, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+	require.NoError(t, err)
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, second.Key.Seq))
+	firstAckedAt := mustGet(t, store, first.Key).UpdatedAt
+	require.NoError(t, db.Close())
+
+	// When
+	db, err = sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	store, err = NewSQLite(db)
+	require.NoError(t, err)
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, first.Key.Seq))
+
+	// Then
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), state.OutboundAckedThrough)
+	require.Equal(t, firstAckedAt, mustGet(t, store, first.Key).UpdatedAt)
+}
+
+func TestAckWatermarkCannotAdvanceBeyondDurableTail(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	frame, err := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+	require.NoError(t, err)
+
+	// When
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, 99))
+
+	// Then
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, frame.Key.Seq, state.OutboundAckedThrough)
+}
+
+func TestAckAdvanceAfterSevenThousandHistoryRowsUpdatesOneFrame(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	statement, err := tx.Prepare(`
+		INSERT INTO reliablemq_frames (
+			queue_id, stream, seq, direction, kind, payload_json, metadata_json,
+			status, error_message, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+	`)
+	require.NoError(t, err)
+	now := formatTime(time.Now().UTC())
+	for seq := int64(1); seq <= 7001; seq++ {
+		_, err = statement.Exec("conn_1", string(reliablemq.StreamACP), seq,
+			string(reliablemq.DirectionOutbound), string(reliablemq.FrameKindData), `{}`, `{}`,
+			string(reliablemq.StatusPending), now, now)
+		require.NoError(t, err)
+	}
+	require.NoError(t, statement.Close())
+	require.NoError(t, tx.Commit())
+	require.NoError(t, store.AckOutboundThrough(context.Background(), "conn_1", reliablemq.StreamACP, 7000))
+	_, err = db.Exec(`CREATE TABLE frame_update_audit (updates INTEGER NOT NULL)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO frame_update_audit (updates) VALUES (0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TRIGGER count_outbound_frame_updates
+		AFTER UPDATE ON reliablemq_frames
+		BEGIN
+			UPDATE frame_update_audit SET updates = updates + 1;
+		END
+	`)
+	require.NoError(t, err)
+
+	// When
+	require.NoError(t, store.AckOutboundThrough(context.Background(), "conn_1", reliablemq.StreamACP, 7001))
+
+	// Then
+	var updates int
+	require.NoError(t, db.QueryRow(`SELECT updates FROM frame_update_audit`).Scan(&updates))
+	require.Equal(t, 1, updates)
+}
+
+func TestExistingQueueStateSchemaBackfillsAckWatermark(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	_, err := db.Exec(`
+		CREATE TABLE reliablemq_frames (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			queue_id TEXT NOT NULL, stream TEXT NOT NULL, seq INTEGER NOT NULL,
+			direction TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT,
+			metadata_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+			error_message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL, UNIQUE(queue_id, stream, seq, direction)
+		);
+		CREATE TABLE reliablemq_frames_queue_state (
+			queue_id TEXT NOT NULL, stream TEXT NOT NULL,
+			next_outbound_seq INTEGER NOT NULL DEFAULT 1,
+			inbound_applied_through INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY (queue_id, stream)
+		);
+		INSERT INTO reliablemq_frames (
+			queue_id, stream, seq, direction, kind, payload_json, metadata_json,
+			status, error_message, created_at, updated_at
+		) VALUES ('conn_1', 'acp', 9, 'outbound', 'data', '{}', '{}', 'acked', '', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
+		INSERT INTO reliablemq_frames_queue_state (
+			queue_id, stream, next_outbound_seq, inbound_applied_through, created_at, updated_at
+		) VALUES ('conn_1', 'acp', 10, 0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
+	`)
+	require.NoError(t, err)
+
+	// When
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	state, err := store.LoadQueueState(context.Background(), "conn_1", reliablemq.StreamACP)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(9), state.OutboundAckedThrough)
+}
+
 func TestListOutboundReplayFromUsesExactCursorAndLimit(t *testing.T) {
 	// Given
 	store := newTestStore(t)
@@ -452,6 +615,44 @@ func TestApplyBatchUpdatesExistingFrameFinalStatus(t *testing.T) {
 	require.Equal(t, "sent", got.Metadata["phase"])
 }
 
+func TestApplyBatchAdvancesEachOutboundAckWatermarkOnce(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	var patches []reliablemq.StorePatch
+	for i := 0; i < 4; i++ {
+		frame, appendErr := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+		require.NoError(t, appendErr)
+		patches = append(patches, reliablemq.StorePatch{Key: frame.Key, Status: reliablemq.StatusAcked})
+	}
+	_, err = db.Exec(`CREATE TABLE ack_watermark_audit (updates INTEGER NOT NULL)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO ack_watermark_audit (updates) VALUES (0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		CREATE TRIGGER count_ack_watermark_updates
+		AFTER UPDATE OF outbound_acked_through ON reliablemq_frames_queue_state
+		WHEN NEW.outbound_acked_through <> OLD.outbound_acked_through
+		BEGIN
+			UPDATE ack_watermark_audit SET updates = updates + 1;
+		END
+	`)
+	require.NoError(t, err)
+
+	// When
+	require.NoError(t, store.ApplyBatch(ctx, reliablemq.StoreBatch{Patches: patches}))
+
+	// Then
+	var updates int
+	require.NoError(t, db.QueryRow(`SELECT updates FROM ack_watermark_audit`).Scan(&updates))
+	require.Equal(t, 1, updates)
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), state.OutboundAckedThrough)
+}
+
 func TestApplyBatchAdvancesOutboundSeqCursor(t *testing.T) {
 	// Given
 	store := newTestStore(t)
@@ -542,6 +743,77 @@ func TestReplayLists(t *testing.T) {
 	require.Equal(t, pending.Key, outbound[0].Key)
 	require.Len(t, inbound, 1)
 	require.Equal(t, received.Key, inbound[0].Key)
+}
+
+func TestPruneAckedOutboundPreservesRecentRowsAndLatestDebugTail(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	var frames []reliablemq.Frame
+	for i := 0; i < 6; i++ {
+		frame, appendErr := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+		require.NoError(t, appendErr)
+		frames = append(frames, frame)
+	}
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, 6))
+	old := time.Now().UTC().Add(-4 * 24 * time.Hour)
+	recent := time.Now().UTC().Add(-time.Hour)
+	_, err = db.Exec(`UPDATE reliablemq_frames SET updated_at = ?`, formatTime(old))
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE reliablemq_frames SET updated_at = ? WHERE seq = 2`, formatTime(recent))
+	require.NoError(t, err)
+
+	// When
+	result, err := store.PruneAckedOutbound(ctx, AckedOutboundPruneOptions{
+		OlderThan:          time.Now().UTC().Add(-3 * 24 * time.Hour),
+		KeepLatestPerQueue: 2,
+		Limit:              10,
+	})
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(3), result.Deleted)
+	for _, seq := range []int64{1, 3, 4} {
+		_, ok, getErr := store.Get(ctx, frames[seq-1].Key)
+		require.NoError(t, getErr)
+		require.False(t, ok, "seq %d should be pruned", seq)
+	}
+	for _, seq := range []int64{2, 5, 6} {
+		_, ok, getErr := store.Get(ctx, frames[seq-1].Key)
+		require.NoError(t, getErr)
+		require.True(t, ok, "seq %d should be retained", seq)
+	}
+}
+
+func TestPruneAckedOutboundDeletesAtMostOneBatch(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	for i := 0; i < 10; i++ {
+		_, appendErr := store.AppendOutboundData(ctx, "conn_1", reliablemq.StreamACP, []byte(`{}`), nil)
+		require.NoError(t, appendErr)
+	}
+	require.NoError(t, store.AckOutboundThrough(ctx, "conn_1", reliablemq.StreamACP, 10))
+	_, err = db.Exec(`UPDATE reliablemq_frames SET updated_at = ?`, formatTime(time.Now().UTC().Add(-4*24*time.Hour)))
+	require.NoError(t, err)
+
+	// When
+	result, err := store.PruneAckedOutbound(ctx, AckedOutboundPruneOptions{
+		OlderThan:          time.Now().UTC().Add(-3 * 24 * time.Hour),
+		KeepLatestPerQueue: 2,
+		Limit:              3,
+	})
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(3), result.Deleted)
+	var remaining int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM reliablemq_frames`).Scan(&remaining))
+	require.Equal(t, 7, remaining)
 }
 
 func TestInvalidOperations(t *testing.T) {

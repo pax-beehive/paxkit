@@ -48,6 +48,7 @@ type DurableStore interface {
 
 type QueueState struct {
 	NextOutboundSeq       int64
+	OutboundAckedThrough  int64
 	InboundAppliedThrough int64
 }
 

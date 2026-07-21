@@ -90,6 +90,30 @@ func TestProducerWriteBehindStoreBatchesAckThrough(t *testing.T) {
 	assert.Equal(t, int64(2), sink.batches[0].Patches[0].Key.Seq)
 }
 
+func TestProducerWriteBehindStoreCoalescesCumulativeAcksPerQueue(t *testing.T) {
+	// Given
+	sink := newProducerWriteBehindSink()
+	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
+	defer closeProducerWriteBehindStore(t, store)
+	for i := 0; i < 3; i++ {
+		_, err := store.AppendOutboundData(context.Background(), "queue_1", StreamACP, json.RawMessage(`{"n":1}`), nil)
+		require.NoError(t, err)
+	}
+
+	// When
+	require.NoError(t, store.AckOutboundThrough(context.Background(), "queue_1", StreamACP, 1))
+	require.NoError(t, store.AckOutboundThrough(context.Background(), "queue_1", StreamACP, 3))
+	require.NoError(t, store.AckOutboundThrough(context.Background(), "queue_1", StreamACP, 2))
+	require.NoError(t, store.AckOutboundThrough(context.Background(), "queue_1", StreamACP, 3))
+	require.NoError(t, store.Flush(context.Background()))
+
+	// Then
+	require.Len(t, sink.batches, 1)
+	require.Len(t, sink.batches[0].Patches, 1)
+	require.Equal(t, StatusAcked, sink.batches[0].Patches[0].Status)
+	require.Equal(t, int64(3), sink.batches[0].Patches[0].Key.Seq)
+}
+
 func TestProducerWriteBehindStoreDoesNotBlockOutboundWhenFlushIsBlocked(t *testing.T) {
 	sink := newBlockingProducerWriteBehindSink()
 	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
