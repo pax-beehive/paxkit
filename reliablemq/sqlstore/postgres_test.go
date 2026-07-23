@@ -166,6 +166,10 @@ func (c fakePostgresConn) QueryContext(_ context.Context, query string, _ []driv
 		return c.columnRows(), nil
 	case strings.Contains(query, "pg_index"):
 		return c.constraintRows(), nil
+	case strings.Contains(query, "inbound_acked_through = 0"):
+		return &fakePostgresRows{
+			columns: []string{"queue_id", "stream"},
+		}, nil
 	default:
 		return nil, fmt.Errorf("unexpected query %q", query)
 	}

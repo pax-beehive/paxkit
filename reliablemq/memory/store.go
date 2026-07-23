@@ -15,6 +15,7 @@ type Store struct {
 	mu             sync.Mutex
 	now            func() time.Time
 	seqs           map[seqKey]int64
+	inboundAcked   map[queueKey]int64
 	inboundApplied map[queueKey]int64
 	frames         map[reliablemq.FrameKey]reliablemq.Frame
 }
@@ -34,6 +35,7 @@ func New() *Store {
 	return &Store{
 		now:            time.Now,
 		seqs:           make(map[seqKey]int64),
+		inboundAcked:   make(map[queueKey]int64),
 		inboundApplied: make(map[queueKey]int64),
 		frames:         make(map[reliablemq.FrameKey]reliablemq.Frame),
 	}
@@ -78,7 +80,12 @@ func (s *Store) SaveInboundIfAbsent(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if frame.Key.Seq <= s.inboundApplied[queueKey{queueID: frame.Key.QueueID, stream: frame.Key.Stream}] {
+	queueKey := queueKey{queueID: frame.Key.QueueID, stream: frame.Key.Stream}
+	if frame.Key.Seq <= s.inboundApplied[queueKey] {
+		if frame.Key.Seq == s.inboundAcked[queueKey]+1 {
+			s.inboundAcked[queueKey] = frame.Key.Seq
+			s.advanceInboundAckedThroughLocked(queueKey)
+		}
 		frame.Status = reliablemq.StatusApplied
 		return false, frame.Clone(), nil
 	}
@@ -91,6 +98,7 @@ func (s *Store) SaveInboundIfAbsent(
 	frame.CreatedAt = now
 	frame.UpdatedAt = now
 	s.frames[frame.Key] = frame
+	s.advanceInboundAckedThroughLocked(queueKey)
 	return true, frame.Clone(), nil
 }
 
@@ -134,6 +142,7 @@ func (s *Store) LoadQueueState(
 	defer s.mu.Unlock()
 	return reliablemq.QueueState{
 		NextOutboundSeq:       s.seqs[seqKey{queueID: queueID, stream: stream, direction: reliablemq.DirectionOutbound}] + 1,
+		InboundAckedThrough:   s.inboundAcked[queueKey{queueID: queueID, stream: stream}],
 		InboundAppliedThrough: s.inboundApplied[queueKey{queueID: queueID, stream: stream}],
 	}, nil
 }
@@ -197,15 +206,7 @@ func (s *Store) ConsumerAckedThrough(
 	_ = ctx
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := int64(1)
-	for {
-		key := reliablemq.FrameKey{QueueID: queueID, Stream: stream, Seq: next, Direction: reliablemq.DirectionInbound}
-		frame, ok := s.frames[key]
-		if !ok || (frame.Status != reliablemq.StatusReceived && frame.Status != reliablemq.StatusApplied && frame.Status != reliablemq.StatusRejected) {
-			return next - 1, nil
-		}
-		next++
-	}
+	return s.inboundAcked[queueKey{queueID: queueID, stream: stream}], nil
 }
 
 func (s *Store) ListInboundReplay(
@@ -398,6 +399,30 @@ func (s *Store) updateAndAdvanceInbound(key reliablemq.FrameKey, apply func(*rel
 		}
 	}
 	return nil
+}
+
+func (s *Store) advanceInboundAckedThroughLocked(key queueKey) {
+	next := s.inboundAcked[key] + 1
+	for {
+		frameKey := reliablemq.FrameKey{
+			QueueID:   key.queueID,
+			Stream:    key.stream,
+			Seq:       next,
+			Direction: reliablemq.DirectionInbound,
+		}
+		frame, ok := s.frames[frameKey]
+		if !ok || !isConsumerAckedStatus(frame.Status) {
+			return
+		}
+		s.inboundAcked[key] = next
+		next++
+	}
+}
+
+func isConsumerAckedStatus(status reliablemq.Status) bool {
+	return status == reliablemq.StatusReceived ||
+		status == reliablemq.StatusApplied ||
+		status == reliablemq.StatusRejected
 }
 
 func (s *Store) update(key reliablemq.FrameKey, apply func(*reliablemq.Frame)) error {
