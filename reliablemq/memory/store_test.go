@@ -84,6 +84,117 @@ func TestStoreInboundDuplicate(t *testing.T) {
 	require.Equal(t, "first", stored.Metadata["source"])
 }
 
+func TestStoreInboundConsumerACKWatermarkAdvancesAcrossFilledGap(t *testing.T) {
+	// Given
+	store := New()
+	ctx := context.Background()
+
+	// When
+	saveInboundFrame := func(seq int64) {
+		t.Helper()
+		inserted, _, err := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+			Key: reliablemq.FrameKey{
+				QueueID:   "conn_1",
+				Stream:    reliablemq.StreamACP,
+				Seq:       seq,
+				Direction: reliablemq.DirectionInbound,
+			},
+			Kind:    reliablemq.FrameKindData,
+			Payload: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.True(t, inserted)
+	}
+	saveInboundFrame(1)
+	saveInboundFrame(3)
+
+	// Then
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), through)
+
+	// When
+	saveInboundFrame(2)
+
+	// Then
+	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), through)
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), state.InboundAckedThrough)
+}
+
+func TestStoreInboundAppliedCursorDoesNotReplaceConsumerACKWatermark(t *testing.T) {
+	// Given
+	store := New()
+	ctx := context.Background()
+	inserted, frame, err := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+		Key: reliablemq.FrameKey{
+			QueueID:   "conn_1",
+			Stream:    reliablemq.StreamACP,
+			Seq:       2,
+			Direction: reliablemq.DirectionInbound,
+		},
+		Kind:    reliablemq.FrameKindData,
+		Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	// When
+	require.NoError(t, store.MarkApplied(ctx, frame.Key))
+
+	// Then
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), state.InboundAppliedThrough)
+	require.Zero(t, state.InboundAckedThrough)
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Zero(t, through)
+}
+
+func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing.T) {
+	// Given
+	store := New()
+	ctx := context.Background()
+	key := queueKey{queueID: "conn_1", stream: reliablemq.StreamACP}
+	store.inboundApplied[key] = 2
+	save := func(seq int64) {
+		t.Helper()
+		inserted, stored, err := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+			Key: reliablemq.FrameKey{
+				QueueID:   "conn_1",
+				Stream:    reliablemq.StreamACP,
+				Seq:       seq,
+				Direction: reliablemq.DirectionInbound,
+			},
+			Kind:    reliablemq.FrameKindData,
+			Payload: []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, inserted)
+		require.Equal(t, reliablemq.StatusApplied, stored.Status)
+	}
+
+	// When / Then
+	save(2)
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Zero(t, through)
+
+	save(1)
+	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), through)
+
+	save(2)
+	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), through)
+}
+
 func TestStoreCumulativeACK(t *testing.T) {
 	// Given
 	store := New()

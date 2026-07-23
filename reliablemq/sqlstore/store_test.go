@@ -303,6 +303,245 @@ func TestSaveInboundIfAbsent(t *testing.T) {
 	require.Equal(t, "first", duplicateStored.Metadata["source"])
 }
 
+func TestConsumerACKWatermarkAdvancesAcrossFilledGap(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	save := func(seq int64) {
+		t.Helper()
+		_, _, saveErr := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+			Key: reliablemq.FrameKey{
+				QueueID:   "conn_1",
+				Stream:    reliablemq.StreamACP,
+				Seq:       seq,
+				Direction: reliablemq.DirectionInbound,
+			},
+			Kind:    reliablemq.FrameKindData,
+			Payload: []byte(`{}`),
+		})
+		require.NoError(t, saveErr)
+	}
+	save(1)
+	save(3)
+
+	// When
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(1), through)
+
+	// When
+	save(2)
+
+	// Then
+	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), through)
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), state.InboundAckedThrough)
+}
+
+func TestConsumerACKInitializesMissingQueueState(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+
+	// When
+	through, err := store.ConsumerAckedThrough(
+		context.Background(),
+		"new_queue",
+		reliablemq.StreamACP,
+	)
+
+	// Then
+	require.NoError(t, err)
+	require.Zero(t, through)
+	state, err := store.LoadQueueState(
+		context.Background(),
+		"new_queue",
+		reliablemq.StreamACP,
+	)
+	require.NoError(t, err)
+	require.Zero(t, state.InboundAckedThrough)
+}
+
+func TestMissingQueueStateRebuildsDurableTailsOnce(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	outbound, err := store.AppendOutboundData(
+		ctx,
+		"conn_1",
+		reliablemq.StreamACP,
+		[]byte(`{}`),
+		nil,
+	)
+	require.NoError(t, err)
+	for _, seq := range []int64{1, 3} {
+		_, _, err = store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+			Key: reliablemq.FrameKey{
+				QueueID:   "conn_1",
+				Stream:    reliablemq.StreamACP,
+				Seq:       seq,
+				Direction: reliablemq.DirectionInbound,
+			},
+			Kind:    reliablemq.FrameKindData,
+			Payload: []byte(`{}`),
+		})
+		require.NoError(t, err)
+	}
+	_, err = db.Exec(
+		`DELETE FROM reliablemq_frames_queue_state WHERE queue_id = ? AND stream = ?`,
+		"conn_1",
+		string(reliablemq.StreamACP),
+	)
+	require.NoError(t, err)
+
+	// When
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(1), through)
+	nextOutbound, err := store.AppendOutboundData(
+		ctx,
+		"conn_1",
+		reliablemq.StreamACP,
+		[]byte(`{}`),
+		nil,
+	)
+	require.NoError(t, err)
+	require.Equal(t, outbound.Key.Seq+1, nextOutbound.Key.Seq)
+}
+
+func TestConsumerACKWatermarkDoesNotDependOnSweptHistory(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	for seq := int64(1); seq <= 100; seq++ {
+		_, _, err = store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+			Key: reliablemq.FrameKey{
+				QueueID:   "conn_1",
+				Stream:    reliablemq.StreamACP,
+				Seq:       seq,
+				Direction: reliablemq.DirectionInbound,
+			},
+			Kind:    reliablemq.FrameKindData,
+			Payload: []byte(`{}`),
+		})
+		require.NoError(t, err)
+	}
+	_, err = db.Exec(`
+		DELETE FROM reliablemq_frames
+		WHERE queue_id = ? AND stream = ? AND direction = ? AND seq < ?
+	`, "conn_1", string(reliablemq.StreamACP), string(reliablemq.DirectionInbound), int64(100))
+	require.NoError(t, err)
+
+	// When
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	_, _, err = store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+		Key: reliablemq.FrameKey{
+			QueueID:   "conn_1",
+			Stream:    reliablemq.StreamACP,
+			Seq:       101,
+			Direction: reliablemq.DirectionInbound,
+		},
+		Kind:    reliablemq.FrameKindData,
+		Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+	advanced, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(100), through)
+	require.Equal(t, int64(101), advanced)
+}
+
+func TestInboundAppliedCursorDoesNotReplaceConsumerACKWatermark(t *testing.T) {
+	// Given
+	store := newTestStore(t)
+	ctx := context.Background()
+	_, frame, err := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+		Key: reliablemq.FrameKey{
+			QueueID:   "conn_1",
+			Stream:    reliablemq.StreamACP,
+			Seq:       2,
+			Direction: reliablemq.DirectionInbound,
+		},
+		Kind:    reliablemq.FrameKindData,
+		Payload: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	// When
+	require.NoError(t, store.MarkApplied(ctx, frame.Key))
+
+	// Then
+	state, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), state.InboundAppliedThrough)
+	require.Zero(t, state.InboundAckedThrough)
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Zero(t, through)
+}
+
+func TestAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	ctx := context.Background()
+	_, err = db.Exec(`
+		INSERT INTO reliablemq_frames_queue_state (
+			queue_id, stream, next_outbound_seq, outbound_acked_through,
+			inbound_acked_through, inbound_applied_through, created_at, updated_at
+		) VALUES (?, ?, 1, 0, 0, 2, ?, ?)
+	`, "conn_1", string(reliablemq.StreamACP), formatTime(time.Now().UTC()), formatTime(time.Now().UTC()))
+	require.NoError(t, err)
+	save := func(seq int64) {
+		t.Helper()
+		inserted, stored, saveErr := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+			Key: reliablemq.FrameKey{
+				QueueID:   "conn_1",
+				Stream:    reliablemq.StreamACP,
+				Seq:       seq,
+				Direction: reliablemq.DirectionInbound,
+			},
+			Kind:    reliablemq.FrameKindData,
+			Payload: []byte(`{}`),
+		})
+		require.NoError(t, saveErr)
+		require.False(t, inserted)
+		require.Equal(t, reliablemq.StatusApplied, stored.Status)
+	}
+
+	// When / Then
+	save(2)
+	through, err := store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Zero(t, through)
+
+	save(1)
+	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), through)
+
+	save(2)
+	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), through)
+}
+
 func TestSaveInboundSkipsAlreadyAppliedSweptFrame(t *testing.T) {
 	// Given
 	db := openTestDB(t)
@@ -497,6 +736,13 @@ func TestExistingQueueStateSchemaBackfillsAckWatermark(t *testing.T) {
 			queue_id, stream, seq, direction, kind, payload_json, metadata_json,
 			status, error_message, created_at, updated_at
 		) VALUES ('conn_1', 'acp', 9, 'outbound', 'data', '{}', '{}', 'acked', '', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
+		INSERT INTO reliablemq_frames (
+			queue_id, stream, seq, direction, kind, payload_json, metadata_json,
+			status, error_message, created_at, updated_at
+		) VALUES
+			('conn_1', 'acp', 1, 'inbound', 'data', '{}', '{}', 'received', '', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'),
+			('conn_1', 'acp', 2, 'inbound', 'data', '{}', '{}', 'applied', '', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'),
+			('conn_1', 'acp', 4, 'inbound', 'data', '{}', '{}', 'received', '', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
 		INSERT INTO reliablemq_frames_queue_state (
 			queue_id, stream, next_outbound_seq, inbound_applied_through, created_at, updated_at
 		) VALUES ('conn_1', 'acp', 10, 0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
@@ -511,6 +757,49 @@ func TestExistingQueueStateSchemaBackfillsAckWatermark(t *testing.T) {
 	// Then
 	require.NoError(t, err)
 	require.Equal(t, int64(9), state.OutboundAckedThrough)
+	require.Equal(t, int64(2), state.InboundAckedThrough)
+}
+
+func TestExistingAppliedCursorDoesNotBackfillConsumerACKAcrossGap(t *testing.T) {
+	// Given
+	db := openTestDB(t)
+	_, err := db.Exec(`
+		CREATE TABLE reliablemq_frames (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			queue_id TEXT NOT NULL, stream TEXT NOT NULL, seq INTEGER NOT NULL,
+			direction TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT,
+			metadata_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+			error_message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL, UNIQUE(queue_id, stream, seq, direction)
+		);
+		CREATE TABLE reliablemq_frames_queue_state (
+			queue_id TEXT NOT NULL, stream TEXT NOT NULL,
+			next_outbound_seq INTEGER NOT NULL DEFAULT 1,
+			outbound_acked_through INTEGER NOT NULL DEFAULT 0,
+			inbound_applied_through INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY (queue_id, stream)
+		);
+		INSERT INTO reliablemq_frames (
+			queue_id, stream, seq, direction, kind, payload_json, metadata_json,
+			status, error_message, created_at, updated_at
+		) VALUES ('conn_1', 'acp', 2, 'inbound', 'data', '{}', '{}', 'applied', '', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
+		INSERT INTO reliablemq_frames_queue_state (
+			queue_id, stream, next_outbound_seq, outbound_acked_through,
+			inbound_applied_through, created_at, updated_at
+		) VALUES ('conn_1', 'acp', 1, 0, 2, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
+	`)
+	require.NoError(t, err)
+
+	// When
+	store, err := NewSQLite(db)
+	require.NoError(t, err)
+	state, err := store.LoadQueueState(context.Background(), "conn_1", reliablemq.StreamACP)
+
+	// Then
+	require.NoError(t, err)
+	require.Equal(t, int64(2), state.InboundAppliedThrough)
+	require.Zero(t, state.InboundAckedThrough)
 }
 
 func TestListOutboundReplayFromUsesExactCursorAndLimit(t *testing.T) {
