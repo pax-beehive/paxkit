@@ -23,9 +23,11 @@ type ProducerConfig struct {
 	CursorBatchSize     int
 	MaintenanceEvery    time.Duration
 	MaxUnpersistedBytes int64
-	MaxUnpersistedAge   time.Duration
-	Now                 func() time.Time
-	OnError             func(error)
+	// Deprecated: unpersisted age is observable through ProducerStats but is
+	// not a terminal safety limit. This field is retained for source compatibility.
+	MaxUnpersistedAge time.Duration
+	Now               func() time.Time
+	OnError           func(error)
 }
 
 type ProducerStats struct {
@@ -219,9 +221,6 @@ func NewProducer(ctx context.Context, config ProducerConfig, store DurableStore)
 	}
 	if config.MaxUnpersistedBytes <= 0 {
 		config.MaxUnpersistedBytes = 64 << 20
-	}
-	if config.MaxUnpersistedAge <= 0 {
-		config.MaxUnpersistedAge = 30 * time.Second
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -775,22 +774,6 @@ func (p *Producer) enforceJournalLimits(state *producerOwnerState) {
 			ErrProducerJournalLimit,
 			state.unpersistedBytes,
 			p.config.MaxUnpersistedBytes,
-		))
-		return
-	}
-	oldest := p.config.Now()
-	for _, entry := range state.unpersisted {
-		if entry.acceptedAt.Before(oldest) {
-			oldest = entry.acceptedAt
-		}
-	}
-	age := p.config.Now().Sub(oldest)
-	if age > p.config.MaxUnpersistedAge {
-		p.fail(state, fmt.Errorf(
-			"%w: oldest unpersisted frame age %s exceeds %s",
-			ErrProducerJournalLimit,
-			age,
-			p.config.MaxUnpersistedAge,
 		))
 	}
 }

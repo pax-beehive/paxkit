@@ -188,7 +188,7 @@ func TestProducerFailsExplicitlyWhenUnpersistedBytesExceedLimit(t *testing.T) {
 	require.ErrorIs(t, engine.Send(context.Background(), outboundMessage(2)), ErrProducerNotReady)
 }
 
-func TestProducerFailsExplicitlyWhenUnpersistedAgeExceedsLimit(t *testing.T) {
+func TestProducerKeepsSendingWhenUnpersistedAgeExceedsLimit(t *testing.T) {
 	// Given
 	sink := newProducerWriteBehindSink()
 	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
@@ -210,23 +210,42 @@ func TestProducerFailsExplicitlyWhenUnpersistedAgeExceedsLimit(t *testing.T) {
 		},
 	})
 	defer closeProducer(t, producer)
+	sender := newRecordingEnvelopeSender()
+	binding, err := producer.Bind(context.Background(), sender, 0)
+	require.NoError(t, err)
+	defer binding.Close()
 	engine := NewEngine(Config{}, store, producer, nil)
 	require.NoError(t, engine.Send(context.Background(), outboundMessage(1)))
 	require.Eventually(t, func() bool {
-		return producer.Stats().UnpersistedBytes > 0
+		return sender.dataSeqsEqual([]int64{1}) &&
+			producer.Stats().UnpersistedBytes > 0
 	}, time.Second, time.Millisecond)
 
 	// When
 	nowNanos.Add(int64(11 * time.Millisecond))
 
 	// Then
-	select {
-	case err := <-failed:
-		require.ErrorIs(t, err, ErrProducerJournalLimit)
-	case <-time.After(time.Second):
-		t.Fatal("producer did not report its journal age safety limit")
-	}
-	require.ErrorIs(t, engine.Send(context.Background(), outboundMessage(2)), ErrProducerNotReady)
+	require.Eventually(t, func() bool {
+		return producer.Stats().OldestUnpersistedAge > 10*time.Millisecond
+	}, time.Second, time.Millisecond)
+	require.Never(t, func() bool {
+		select {
+		case <-binding.Done():
+			return true
+		default:
+			return false
+		}
+	}, 25*time.Millisecond, time.Millisecond)
+	assert.True(t, producer.Stats().Ready)
+	assert.True(t, producer.Stats().Bound)
+	assert.Empty(t, failed)
+
+	require.NoError(t, engine.Send(context.Background(), outboundMessage(2)))
+	require.Eventually(t, func() bool {
+		return sender.dataSeqsEqual([]int64{1, 2})
+	}, time.Second, time.Millisecond)
+	_, err = producer.Checkpoint(context.Background())
+	require.NoError(t, err)
 }
 
 func TestProducerHeadFailurePreventsLaterFrameBypass(t *testing.T) {
