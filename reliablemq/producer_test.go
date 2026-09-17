@@ -13,6 +13,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestProducerKeepsBindingWhenACKPrecedesWriteCompletion(t *testing.T) {
+	sink := newProducerWriteBehindSink()
+	store := NewProducerWriteBehindStore(sink, WithProducerWriteBehindManualFlush())
+	defer closeProducerWriteBehindStore(t, store)
+	producer := newTestProducer(t, store)
+	defer closeProducer(t, producer)
+	sender := newBlockingFirstEnvelopeSender()
+	binding, err := producer.Bind(context.Background(), sender, 0)
+	require.NoError(t, err)
+	defer binding.Close()
+	engine := NewEngine(Config{}, store, producer, nil)
+
+	require.NoError(t, engine.Send(context.Background(), outboundMessage(1)))
+	select {
+	case <-sender.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("first write did not start")
+	}
+	// The peer can acknowledge bytes before the local writer reports success.
+	require.NoError(t, engine.Receive(context.Background(), AckEnvelope("queue_1", StreamACP, 1)))
+	require.Eventually(t, func() bool {
+		return producer.Stats().AckedThrough == 1
+	}, time.Second, time.Millisecond)
+	require.NoError(t, engine.Send(context.Background(), outboundMessage(2)))
+	close(sender.release)
+	require.Eventually(t, func() bool {
+		return sender.dataSeqsEqual([]int64{1, 2})
+	}, time.Second, time.Millisecond)
+	assert.True(t, producer.Stats().Bound)
+	assert.Empty(t, producer.Stats().LastError)
+}
+
 func TestProducerSendDoesNotWaitForBlockedJournalOrSocket(t *testing.T) {
 	// Given
 	sink := newBlockingProducerWriteBehindSink()
