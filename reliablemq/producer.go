@@ -912,6 +912,11 @@ func (p *Producer) handleWriteResult(state *producerOwnerState, result producerW
 			state.lastACKSignal = result.request.ackSignal
 		}
 	case producerWriteData:
+		// A peer ACK can reach the owner before the writer completion. The ACK
+		// already advanced the cursor and retired this frame.
+		if result.request.seq <= state.ackedThrough {
+			break
+		}
 		if result.request.seq != state.nextToSend {
 			p.disconnect(state, fmt.Errorf(
 				"%w: wrote seq %d while cursor was %d",
