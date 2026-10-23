@@ -210,6 +210,17 @@ func (s *ProducerWriteBehindStore) listOutboundReplayFrom(
 	if limit <= 0 {
 		limit = 100
 	}
+	// Retain memory frames before a concurrent flush can move them to the sink.
+	s.mu.Lock()
+	memoryFrames := make([]Frame, 0)
+	for key, frame := range s.frames {
+		if key.QueueID == queueID && key.Stream == stream &&
+			key.Direction == DirectionOutbound && key.Seq >= fromSeq {
+			memoryFrames = append(memoryFrames, frame.Clone())
+		}
+	}
+	s.mu.Unlock()
+
 	var (
 		frames []Frame
 		err    error
@@ -230,25 +241,29 @@ func (s *ProducerWriteBehindStore) listOutboundReplayFrom(
 		byKey[frame.Key] = frame.Clone()
 	}
 
-	s.mu.Lock()
-	for key, frame := range s.frames {
-		if key.QueueID != queueID ||
-			key.Stream != stream ||
-			key.Direction != DirectionOutbound ||
-			key.Seq < fromSeq {
-			continue
-		}
+	for _, frame := range memoryFrames {
 		if frame.Status == StatusPending || frame.Status == StatusSent {
-			byKey[key] = frame.Clone()
+			byKey[frame.Key] = frame
 		} else {
-			delete(byKey, key)
+			delete(byKey, frame.Key)
 		}
 	}
+
+	s.mu.Lock()
+	// Refresh existing entries without mixing later appends into this read.
+	for key := range byKey {
+		if frame, ok := s.frames[key]; ok {
+			byKey[key] = frame.Clone()
+		}
+	}
+	ackedThrough := s.queues[producerQueueKey{queueID: queueID, stream: stream}].ackedThrough
 	s.mu.Unlock()
 
 	merged := make([]Frame, 0, len(byKey))
 	for _, frame := range byKey {
-		merged = append(merged, frame)
+		if frame.Key.Seq > ackedThrough && (frame.Status == StatusPending || frame.Status == StatusSent) {
+			merged = append(merged, frame)
+		}
 	}
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Key.Seq < merged[j].Key.Seq

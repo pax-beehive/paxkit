@@ -552,6 +552,18 @@ and live output. It pages until it reaches the exact tail, so a configured list
 limit is a batch size rather than a replay cap. A head write failure disables the
 binding and leaves later frames behind that head.
 
+Write-behind replay retains a copy of memory frames before querying the journal.
+A concurrent flush can then persist and evict those frames without leaving a gap
+between the memory and journal reads. Later memory appends are left to the next
+read; existing snapshot entries can still receive status and metadata updates.
+The current cumulative ACK removes acknowledged frames from the merged result.
+
+An ACK may advance while a journal cursor read is in flight. The producer skips
+acknowledged entries and validates continuity from the first unacknowledged
+sequence. If the ACK consumes an entire cursor page, the producer reloads from
+its new position. A gap in the remaining unacknowledged sequence still disables
+the binding.
+
 ### ReplayInbound
 
 Used after restart/reconnect. Lists received-but-not-applied inbound frames and
