@@ -152,6 +152,24 @@ Expected:
 
 ### Outbound Send
 
+#### Given a replay read overlaps a journal flush, when pending memory frames are persisted and evicted, then replay has no sequence gap
+
+Expected:
+
+- the read retains memory frames captured before the journal query
+- later appends remain available to the next read
+- exact-cursor and fallback stores preserve sequence order and page limits
+- journal I/O does not hold the memory lock or block acceptance
+
+#### Given a cumulative ACK advances during replay, when the cursor read completes, then acknowledged frames do not cause a false gap
+
+Expected:
+
+- acknowledged frames are removed from the merged replay result
+- an empty page consumed by a concurrent ACK reloads from the new cursor
+- remaining frames and subsequent live output use the same binding
+- a gap beyond the cumulative ACK still disables the binding
+
 #### Given the journal sink and socket writer are blocked, when Send is called, then acceptance still returns
 
 Expected:
