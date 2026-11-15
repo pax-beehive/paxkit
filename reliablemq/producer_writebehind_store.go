@@ -274,6 +274,12 @@ func (s *ProducerWriteBehindStore) ListInboundReplay(
 	return s.sink.ListInboundReplay(ctx, queueID, stream, limit)
 }
 
+// QueueStateStore exposes the sink's optional durable cursors for inbound
+// ordering without substituting the producer's unflushed in-memory checkpoint.
+func (s *ProducerWriteBehindStore) QueueStateStore() (QueueStateStore, bool) {
+	return inboundQueueStateStore(s.sink)
+}
+
 func (s *ProducerWriteBehindStore) ConsumerAckedThrough(
 	ctx context.Context,
 	queueID string,

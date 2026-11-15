@@ -304,7 +304,9 @@ application retry: a frame remains eligible for reconnect replay until ACKed.
 
 Called when an inbound hook or dispatcher has a runtime delivery error. This
 records `error_message` and leaves the frame `received` so `ReplayInbound` can
-try delivery again later.
+try delivery again later. The engine returns the original delivery error even
+when recording it succeeds. If recording also fails, the returned error retains
+both causes.
 
 ### UpdateMetadata
 
@@ -555,7 +557,14 @@ binding and leaves later frames behind that head.
 ### ReplayInbound
 
 Used after restart/reconnect. Lists received-but-not-applied inbound frames and
-dispatches them in `seq` order.
+dispatches them in `seq` order. A delivery failure stops the current replay before
+later frames are dispatched; recording a failure does not count as applied
+progress. The next replay retries the failed frame.
+
+When the durable sink exposes `QueueStateStore`, the engine honors its inbound
+applied watermark through `ProducerWriteBehindStore.QueueStateStore()`. This
+optional capability is separate from the producer's buffered outbound checkpoint.
+Legacy sinks without durable queue cursors retain unordered replay semantics.
 
 ## Typical paxd Usage
 
