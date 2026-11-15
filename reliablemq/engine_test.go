@@ -175,7 +175,7 @@ func TestEngineReceiveHookError(t *testing.T) {
 
 	// When
 	err := engine.Receive(context.Background(), Envelope{Type: EnvelopeTypeData, QueueID: "conn_1", Stream: StreamACP, Seq: 1, Payload: json.RawMessage(`{}`)})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, hookErr)
 
 	// Then
 	wantOrder := []string{"SaveInboundIfAbsent:1", "RecordDispatchFailure:1:policy timeout"}
@@ -193,7 +193,7 @@ func TestEngineReceiveDispatchError(t *testing.T) {
 
 	// When
 	err := engine.Receive(context.Background(), Envelope{Type: EnvelopeTypeData, QueueID: "conn_1", Stream: StreamACP, Seq: 1, Payload: json.RawMessage(`{}`)})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, dispatcher.err)
 
 	// Then
 	wantOrder := []string{"SaveInboundIfAbsent:1", "UpdateMetadata:1", "Dispatcher.Dispatch:1", "RecordDispatchFailure:1:stdin closed"}

@@ -3,6 +3,7 @@ package reliablemq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -173,7 +174,7 @@ func (e *Engine) receiveFrame(ctx context.Context, env Envelope) error {
 	if err := e.Producer.submitInboundACK(through); err != nil {
 		return err
 	}
-	if _, ordered := e.Store.(QueueStateStore); ordered {
+	if _, ordered := inboundQueueStateStore(e.Store); ordered {
 		return e.dispatchReadyInbound(ctx, env.QueueID, env.Stream, 1000)
 	}
 	if !inserted {
@@ -192,7 +193,7 @@ func (e *Engine) dispatchReadyInbound(
 		limit = 100
 	}
 	next := int64(0)
-	if loader, ok := e.Store.(QueueStateStore); ok {
+	if loader, ok := inboundQueueStateStore(e.Store); ok {
 		state, err := loader.LoadQueueState(ctx, queueID, stream)
 		if err != nil {
 			return err
@@ -248,7 +249,7 @@ func (e *Engine) dispatchOrApplyInbound(ctx context.Context, frame Frame) error 
 
 	decision, hookErr := e.inboundHandler(ctx, &frame)
 	if hookErr != nil {
-		return e.Store.RecordDispatchFailure(ctx, frame.Key, hookErr.Error())
+		return errors.Join(hookErr, e.Store.RecordDispatchFailure(ctx, frame.Key, hookErr.Error()))
 	}
 	frame.Metadata = decision.Metadata.Clone()
 	if err := e.Store.UpdateMetadata(ctx, frame.Key, frame.Metadata); err != nil {
@@ -263,9 +264,19 @@ func (e *Engine) dispatchOrApplyInbound(ctx context.Context, frame Frame) error 
 	}
 
 	if err := e.Dispatcher.Dispatch(ctx, frame); err != nil {
-		return e.Store.RecordDispatchFailure(ctx, frame.Key, err.Error())
+		return errors.Join(err, e.Store.RecordDispatchFailure(ctx, frame.Key, err.Error()))
 	}
 	return e.Store.MarkApplied(ctx, frame.Key)
+}
+
+func inboundQueueStateStore(store DurableStore) (QueueStateStore, bool) {
+	if provider, ok := store.(interface {
+		QueueStateStore() (QueueStateStore, bool)
+	}); ok {
+		return provider.QueueStateStore()
+	}
+	loader, ok := store.(QueueStateStore)
+	return loader, ok
 }
 
 func ValidateOutboundMessage(msg OutboundMessage) error {
