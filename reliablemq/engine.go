@@ -193,14 +193,23 @@ func (e *Engine) dispatchReadyInbound(
 		limit = 100
 	}
 	next := int64(0)
-	if loader, ok := inboundQueueStateStore(e.Store); ok {
+	appliedThrough := int64(0)
+	ackedThrough := int64(0)
+	loader, ordered := inboundQueueStateStore(e.Store)
+	if ordered {
 		state, err := loader.LoadQueueState(ctx, queueID, stream)
 		if err != nil {
 			return err
 		}
-		next = state.InboundAppliedThrough + 1
+		if err := validateInboundCheckpoint(queueID, stream, state); err != nil {
+			return err
+		}
+		appliedThrough = state.InboundAppliedThrough
+		ackedThrough = state.InboundAckedThrough
+		next = appliedThrough + 1
 	}
 
+replay:
 	for {
 		frames, err := e.Store.ListInboundReplay(ctx, queueID, stream, limit)
 		if err != nil {
@@ -212,10 +221,26 @@ func (e *Engine) dispatchReadyInbound(
 		progressed := false
 		for _, frame := range frames {
 			if next > 0 {
+				if frame.Status == StatusReceived && frame.Key.Seq <= appliedThrough {
+					return &InboundHistoryError{
+						QueueID: queueID, Stream: stream,
+						Seq: frame.Key.Seq, AppliedThrough: appliedThrough,
+					}
+				}
 				if frame.Key.Seq < next {
 					continue
 				}
 				if frame.Key.Seq != next {
+					state, advanced, err := refreshInboundGap(ctx, loader, queueID, stream, next, frame.Key.Seq, ackedThrough)
+					if err != nil {
+						return err
+					}
+					if advanced {
+						appliedThrough = state.InboundAppliedThrough
+						ackedThrough = state.InboundAckedThrough
+						next = appliedThrough + 1
+						continue replay
+					}
 					return nil
 				}
 			}
@@ -231,6 +256,47 @@ func (e *Engine) dispatchReadyInbound(
 			return nil
 		}
 	}
+}
+
+func refreshInboundGap(
+	ctx context.Context,
+	loader QueueStateStore,
+	queueID string,
+	stream Stream,
+	expected, observed, ackedThrough int64,
+) (QueueState, bool, error) {
+	if expected > ackedThrough {
+		return QueueState{}, false, nil
+	}
+	state, err := loader.LoadQueueState(ctx, queueID, stream)
+	if err != nil {
+		return QueueState{}, false, err
+	}
+	if err := validateInboundCheckpoint(queueID, stream, state); err != nil {
+		return QueueState{}, false, err
+	}
+	if state.InboundAppliedThrough >= expected {
+		return state, true, nil
+	}
+	if expected > state.InboundAckedThrough {
+		return state, false, nil
+	}
+	return state, false, &InboundHistoryError{
+		QueueID: queueID, Stream: stream, Seq: observed,
+		ExpectedSeq: expected, AppliedThrough: state.InboundAppliedThrough,
+		AckedThrough: state.InboundAckedThrough,
+	}
+}
+
+func validateInboundCheckpoint(queueID string, stream Stream, state QueueState) error {
+	if state.InboundAppliedThrough > state.InboundAckedThrough {
+		return &InboundHistoryError{
+			QueueID: queueID, Stream: stream,
+			AppliedThrough: state.InboundAppliedThrough,
+			AckedThrough:   state.InboundAckedThrough,
+		}
+	}
+	return nil
 }
 
 func (e *Engine) dispatchOrApplyInbound(ctx context.Context, frame Frame) error {

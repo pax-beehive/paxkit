@@ -155,8 +155,8 @@ func TestStoreInboundAppliedCursorDoesNotReplaceConsumerACKWatermark(t *testing.
 	require.Zero(t, through)
 }
 
-func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing.T) {
-	// Given
+func TestStoreAppliedAheadOfReceiptDoesNotRepairACKFromRetries(t *testing.T) {
+	// Given an inconsistent legacy checkpoint with no remaining frame rows.
 	store := New()
 	ctx := context.Background()
 	key := queueKey{queueID: "conn_1", stream: reliablemq.StreamACP}
@@ -173,9 +173,12 @@ func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing
 			Kind:    reliablemq.FrameKindData,
 			Payload: []byte(`{}`),
 		})
-		require.NoError(t, err)
+		require.ErrorIs(t, err, reliablemq.ErrInboundHistoryInconsistent)
+		var detail *reliablemq.InboundHistoryError
+		require.ErrorAs(t, err, &detail)
+		require.Zero(t, detail.Seq)
 		require.False(t, inserted)
-		require.Equal(t, reliablemq.StatusApplied, stored.Status)
+		require.Equal(t, reliablemq.Frame{}, stored)
 	}
 
 	// When / Then
@@ -187,12 +190,14 @@ func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing
 	save(1)
 	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
 	require.NoError(t, err)
-	require.Equal(t, int64(1), through)
+	require.Zero(t, through)
 
 	save(2)
 	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
 	require.NoError(t, err)
-	require.Equal(t, int64(2), through)
+	require.Zero(t, through)
+	require.Equal(t, int64(2), store.inboundApplied[key])
+	require.Empty(t, store.frames)
 }
 
 func TestStoreCumulativeACK(t *testing.T) {
