@@ -870,11 +870,15 @@ func (p *Producer) handleLoadResult(state *producerOwnerState, result producerLo
 		p.disconnect(state, fmt.Errorf("load outbound cursor: %w", result.err))
 		return
 	}
-	expectedSeq := result.from
+	// ACKs may advance while the journal cursor is being read.
+	expectedSeq := max(result.from, state.ackedThrough+1)
 	for _, frame := range result.frames {
 		if err := ValidateFrame(frame); err != nil {
 			p.disconnect(state, err)
 			return
+		}
+		if frame.Key.Seq <= state.ackedThrough {
+			continue
 		}
 		if frame.Key.Direction != DirectionOutbound || frame.Key.Seq != expectedSeq {
 			p.disconnect(state, fmt.Errorf(
@@ -889,7 +893,7 @@ func (p *Producer) handleLoadResult(state *producerOwnerState, result producerLo
 		state.cursorLoaded[frame.Key.Seq] = struct{}{}
 		expectedSeq++
 	}
-	if len(result.frames) == 0 && state.nextToSend <= state.tail {
+	if len(result.frames) == 0 && result.from == state.nextToSend && state.nextToSend <= state.tail {
 		p.disconnect(state, fmt.Errorf("%w at seq %d", ErrProducerJournalGap, state.nextToSend))
 	}
 }
