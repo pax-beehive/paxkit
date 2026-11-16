@@ -36,6 +36,10 @@ func (e *InboundHistoryError) Error() string {
 			ErrInboundHistoryInconsistent, e.QueueID, e.Stream, e.AppliedThrough, e.AckedThrough)
 	}
 	if e.ExpectedSeq > 0 {
+		if e.Seq == 0 {
+			return fmt.Sprintf("%s: queue %q/%q needs seq %d but has no replay row, while durable receipt cursor is %d and applied cursor is %d; preserve the journal and inspect delivery state before recovery",
+				ErrInboundHistoryInconsistent, e.QueueID, e.Stream, e.ExpectedSeq, e.AckedThrough, e.AppliedThrough)
+		}
 		return fmt.Sprintf("%s: queue %q/%q needs seq %d before received seq %d, but durable receipt cursor is %d and applied cursor is %d; preserve the journal and inspect delivery state before recovery",
 			ErrInboundHistoryInconsistent, e.QueueID, e.Stream, e.ExpectedSeq, e.Seq, e.AckedThrough, e.AppliedThrough)
 	}

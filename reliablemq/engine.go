@@ -215,9 +215,6 @@ replay:
 		if err != nil {
 			return err
 		}
-		if len(frames) == 0 {
-			return nil
-		}
 		progressed := false
 		for _, frame := range frames {
 			if next > 0 {
@@ -253,6 +250,18 @@ replay:
 			}
 		}
 		if !progressed || len(frames) < limit {
+			if ordered {
+				state, advanced, err := refreshInboundGap(ctx, loader, queueID, stream, next, 0, ackedThrough)
+				if err != nil {
+					return err
+				}
+				if advanced {
+					appliedThrough = state.InboundAppliedThrough
+					ackedThrough = state.InboundAckedThrough
+					next = appliedThrough + 1
+					continue replay
+				}
+			}
 			return nil
 		}
 	}

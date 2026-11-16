@@ -93,6 +93,62 @@ func TestInboundReplayGivenFillableSQLiteGapThenWaitsForPeerAndPreservesOrder(t 
 	assert.Equal(t, int64(2), state.InboundAppliedThrough)
 }
 
+func TestInboundReplayGivenDeletedSQLiteTailThenFailsClosed(t *testing.T) {
+	for _, prefixApplied := range []bool{true, false} {
+		t.Run(map[bool]string{true: "empty_replay", false: "short_prefix_page"}[prefixApplied], func(t *testing.T) {
+			// Given the only unprocessed tail was lost after durable receipt.
+			db, store := historySQLiteStore(t)
+			ctx := context.Background()
+			for _, seq := range []int64{1, 2} {
+				_, _, err := store.SaveInboundIfAbsent(ctx, reliablemq.Frame{
+					Key: historyKey(seq), Kind: reliablemq.FrameKindData, Payload: []byte(`{}`),
+				})
+				require.NoError(t, err)
+			}
+			if prefixApplied {
+				require.NoError(t, store.MarkApplied(ctx, historyKey(1)))
+			}
+			_, err := db.Exec(`DELETE FROM reliablemq_frames WHERE seq = 2`)
+			require.NoError(t, err)
+			before, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+			require.NoError(t, err)
+			var dispatched []int64
+			engine := reliablemq.NewEngine(reliablemq.Config{}, store, nil, reliablemq.DispatcherFunc(func(_ context.Context, frame reliablemq.Frame) error {
+				dispatched = append(dispatched, frame.Key.Seq)
+				return nil
+			}))
+
+			// When there is no higher row to reveal the missing tail as an ordinary gap.
+			err = engine.ReplayInbound(ctx, "conn_1", reliablemq.StreamACP, 1000)
+
+			// Then recovery reports the missing acknowledged sequence and retains history.
+			require.ErrorIs(t, err, reliablemq.ErrInboundHistoryInconsistent)
+			var detail *reliablemq.InboundHistoryError
+			require.ErrorAs(t, err, &detail)
+			assert.Equal(t, int64(2), detail.ExpectedSeq)
+			assert.Zero(t, detail.Seq)
+			assert.Contains(t, err.Error(), "no replay row")
+			after, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+			require.NoError(t, err)
+			assert.Equal(t, int64(2), after.InboundAckedThrough)
+			assert.Equal(t, int64(1), after.InboundAppliedThrough)
+			if prefixApplied {
+				assert.Empty(t, dispatched)
+				assert.Equal(t, before, after)
+			} else {
+				assert.Equal(t, []int64{1}, dispatched)
+			}
+			frame, found, err := store.Get(ctx, historyKey(1))
+			require.NoError(t, err)
+			require.True(t, found)
+			assert.Equal(t, reliablemq.StatusApplied, frame.Status)
+			_, found, err = store.Get(ctx, historyKey(2))
+			require.NoError(t, err)
+			assert.False(t, found)
+		})
+	}
+}
+
 func TestInboundCheckpointAheadOfReceiptPreservesMemoryAndSQLiteHistory(t *testing.T) {
 	for _, backend := range []string{"memory", "sqlite"} {
 		for _, seq := range []int64{1, 3} {

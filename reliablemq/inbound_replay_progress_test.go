@@ -267,6 +267,26 @@ type changingReplayStore struct {
 	readErr error
 }
 
+func TestInboundReplayRechecksEmptyTailAfterConcurrentDispatcherProgress(t *testing.T) {
+	// Given another dispatcher completed the acknowledged tail after the first read.
+	store := &changingReplayStore{
+		orderedReplayStore: orderedReplayStore{boundedReplayStore: boundedReplayStore{spyStore: newSpyStore()}},
+		fresh:              QueueState{InboundAppliedThrough: 2, InboundAckedThrough: 2},
+	}
+	engine := NewEngine(Config{}, store, nil, DispatcherFunc(func(context.Context, Frame) error {
+		t.Fatal("concurrently applied frames must not dispatch again")
+		return nil
+	}))
+
+	// When the received-row query observes the already completed history.
+	err := engine.ReplayInbound(context.Background(), "conn_1", StreamACP, 1000)
+
+	// Then a fresh checkpoint prevents a false missing-tail diagnosis.
+	require.NoError(t, err)
+	assert.Equal(t, 2, store.stateLoads)
+	assert.Empty(t, store.callSnapshot())
+}
+
 func (s *changingReplayStore) LoadQueueState(context.Context, string, Stream) (QueueState, error) {
 	s.stateLoads++
 	if s.stateLoads == 1 {

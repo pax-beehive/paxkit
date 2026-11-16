@@ -595,6 +595,9 @@ reporting it, so a concurrent dispatcher advancing the applied cursor does not
 cause a false error. A gap beyond the receipt cursor remains eligible for the
 peer to fill after reconciliation. Legacy terminal rows with a missing applied
 cursor are reported for inspection, not automatically replayed or repaired.
+The same check applies when replay reaches an empty result or a short final
+page: an acknowledged but unapplied tail cannot be treated as successful
+recovery merely because no higher row remains to expose the gap.
 
 An applied cursor above the durable receipt cursor is also inconsistent, even
 when no received rows remain. Replay checks that invariant before reading the
