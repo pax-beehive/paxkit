@@ -465,6 +465,14 @@ WebSocket attempt. `NewProducer` bootstraps sequence and checkpoint state before
 it becomes ready. `ProducerRegistry` owns and reuses one producer for each
 partition and closes producers before the store during process shutdown.
 
+Peer ACKs and inbound receipt signals share the producer's in-flight acceptance
+reservation with outbound entries. `Close` rejects new acceptance, waits for
+reserved publications, and drains ACK signals once more before the owner exits.
+It returns a final ACK persistence error rather than silently completing or
+retrying indefinitely. Hosts close the write-behind store afterward to flush
+accepted peer ACKs to the journal. This does not add a socket-flush guarantee for
+outgoing receipt ACKs.
+
 Accepted entries are copied into a non-blocking MPSC ingress. One owner
 goroutine assigns contiguous sequence numbers and owns mutable cursor state:
 
