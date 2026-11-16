@@ -81,6 +81,13 @@ func (s *Store) SaveInboundIfAbsent(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	queueKey := queueKey{queueID: frame.Key.QueueID, stream: frame.Key.Stream}
+	if s.inboundApplied[queueKey] > s.inboundAcked[queueKey] {
+		return false, reliablemq.Frame{}, &reliablemq.InboundHistoryError{
+			QueueID: frame.Key.QueueID, Stream: frame.Key.Stream,
+			AppliedThrough: s.inboundApplied[queueKey],
+			AckedThrough:   s.inboundAcked[queueKey],
+		}
+	}
 	if frame.Key.Seq <= s.inboundApplied[queueKey] {
 		if frame.Key.Seq == s.inboundAcked[queueKey]+1 {
 			s.inboundAcked[queueKey] = frame.Key.Seq

@@ -155,8 +155,8 @@ func TestStoreInboundAppliedCursorDoesNotReplaceConsumerACKWatermark(t *testing.
 	require.Zero(t, through)
 }
 
-func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing.T) {
-	// Given
+func TestStoreAppliedAheadOfReceiptDoesNotRepairACKFromRetries(t *testing.T) {
+	// Given an inconsistent legacy checkpoint with no remaining frame rows.
 	store := New()
 	ctx := context.Background()
 	key := queueKey{queueID: "conn_1", stream: reliablemq.StreamACP}
@@ -173,9 +173,12 @@ func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing
 			Kind:    reliablemq.FrameKindData,
 			Payload: []byte(`{}`),
 		})
-		require.NoError(t, err)
+		require.ErrorIs(t, err, reliablemq.ErrInboundHistoryInconsistent)
+		var detail *reliablemq.InboundHistoryError
+		require.ErrorAs(t, err, &detail)
+		require.Zero(t, detail.Seq)
 		require.False(t, inserted)
-		require.Equal(t, reliablemq.StatusApplied, stored.Status)
+		require.Equal(t, reliablemq.Frame{}, stored)
 	}
 
 	// When / Then
@@ -187,12 +190,57 @@ func TestStoreAppliedSweptRetriesRebuildConsumerACKWithoutSkippingGap(t *testing
 	save(1)
 	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
 	require.NoError(t, err)
-	require.Equal(t, int64(1), through)
+	require.Zero(t, through)
 
 	save(2)
 	through, err = store.ConsumerAckedThrough(ctx, "conn_1", reliablemq.StreamACP)
 	require.NoError(t, err)
-	require.Equal(t, int64(2), through)
+	require.Zero(t, through)
+	require.Equal(t, int64(2), store.inboundApplied[key])
+	require.Empty(t, store.frames)
+}
+
+func TestStoreReplayGivenDeletedAcknowledgedTailThenPreservesHistory(t *testing.T) {
+	// Given the only unapplied tail disappeared after receipt was persisted.
+	store := New()
+	ctx := context.Background()
+	first := reliablemq.Frame{
+		Key:  reliablemq.FrameKey{QueueID: "conn_1", Stream: reliablemq.StreamACP, Seq: 1, Direction: reliablemq.DirectionInbound},
+		Kind: reliablemq.FrameKindData, Payload: []byte(`{}`),
+	}
+	second := first.Clone()
+	second.Key.Seq = 2
+	_, _, err := store.SaveInboundIfAbsent(ctx, first)
+	require.NoError(t, err)
+	_, _, err = store.SaveInboundIfAbsent(ctx, second)
+	require.NoError(t, err)
+	require.NoError(t, store.MarkApplied(ctx, first.Key))
+	delete(store.frames, second.Key)
+	before, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	original, _ := store.Get(first.Key)
+	engine := reliablemq.NewEngine(reliablemq.Config{}, store, nil, reliablemq.DispatcherFunc(func(context.Context, reliablemq.Frame) error {
+		t.Fatal("a missing tail must not dispatch")
+		return nil
+	}))
+
+	// When no received rows or higher sequence remain to expose the gap.
+	err = engine.ReplayInbound(ctx, "conn_1", reliablemq.StreamACP, 1000)
+
+	// Then the error names the missing tail without repairing rows or cursors.
+	require.ErrorIs(t, err, reliablemq.ErrInboundHistoryInconsistent)
+	var detail *reliablemq.InboundHistoryError
+	require.ErrorAs(t, err, &detail)
+	require.Equal(t, int64(2), detail.ExpectedSeq)
+	require.Zero(t, detail.Seq)
+	after, err := store.LoadQueueState(ctx, "conn_1", reliablemq.StreamACP)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	retained, found := store.Get(first.Key)
+	require.True(t, found)
+	require.Equal(t, original, retained)
+	_, found = store.Get(second.Key)
+	require.False(t, found)
 }
 
 func TestStoreCumulativeACK(t *testing.T) {

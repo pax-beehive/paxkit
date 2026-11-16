@@ -270,6 +270,13 @@ func (s *Store) SaveInboundIfAbsent(
 	if err != nil {
 		return false, reliablemq.Frame{}, err
 	}
+	if inboundState.appliedThrough > inboundState.ackedThrough {
+		return false, reliablemq.Frame{}, &reliablemq.InboundHistoryError{
+			QueueID: frame.Key.QueueID, Stream: frame.Key.Stream,
+			AppliedThrough: inboundState.appliedThrough,
+			AckedThrough:   inboundState.ackedThrough,
+		}
+	}
 	if frame.Key.Seq <= inboundState.appliedThrough {
 		frame.Status = reliablemq.StatusApplied
 		if frame.Key.Seq == inboundState.ackedThrough+1 {

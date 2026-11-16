@@ -59,7 +59,7 @@ func TestInboundReplayPreservesDispatchAndFailureRecordingErrors(t *testing.T) {
 	assert.ErrorIs(t, err, recordErr)
 }
 
-func TestInboundReplayUsesDurableWatermarkThroughProducerWriteBehind(t *testing.T) {
+func TestInboundReplayReportsUnsafeHistoryThroughProducerWriteBehind(t *testing.T) {
 	for _, nested := range []bool{false, true} {
 		t.Run(map[bool]string{false: "single_wrapper", true: "nested_wrappers"}[nested], func(t *testing.T) {
 			// Given a durable watermark ahead of a full batch of old failed rows.
@@ -82,13 +82,47 @@ func TestInboundReplayUsesDurableWatermarkThroughProducerWriteBehind(t *testing.
 			// When recovery reads through the write-behind wrapper.
 			err := engine.ReplayInbound(context.Background(), "conn_1", StreamACP, 1000)
 
-			// Then the durable inbound watermark is honored without reapplying history.
-			require.NoError(t, err)
+			// Then recovery fails closed instead of silently dropping unexecuted requests.
+			require.ErrorIs(t, err, ErrInboundHistoryInconsistent)
 			assert.Equal(t, 0, calls)
 			assert.Equal(t, 1, sink.stateLoads)
 			assert.Equal(t, 1, sink.listCalls)
 		})
 	}
+}
+
+func TestInboundReplayGivenStaleFullPageThenDoesNotHideLaterWorkAsSuccessfulRecovery(t *testing.T) {
+	// Given stale received rows left behind by an older cursor that crossed failures.
+	sink := &orderedReplayStore{boundedReplayStore: boundedReplayStore{spyStore: newSpyStore()}, appliedThrough: 1010}
+	for seq := int64(1); seq <= 1011; seq++ {
+		frame := testFrame(seq, DirectionInbound, FrameKindData)
+		frame.Payload = []byte(`{"private":"do not include payload in diagnostics"}`)
+		sink.inboundReplay = append(sink.inboundReplay, frame)
+	}
+	original := append([]Frame(nil), sink.inboundReplay...)
+	dispatched := false
+	engine := NewEngine(Config{}, sink, nil, DispatcherFunc(func(context.Context, Frame) error {
+		dispatched = true
+		return nil
+	}))
+
+	// When the stale prefix fills the entire first page ahead of live sequence 1011.
+	err := engine.ReplayInbound(context.Background(), "conn_1", StreamACP, 1000)
+
+	// Then the caller must reconcile the history before claiming recovery succeeded.
+	require.ErrorIs(t, err, ErrInboundHistoryInconsistent)
+	var detail *InboundHistoryError
+	require.ErrorAs(t, err, &detail)
+	assert.Equal(t, "conn_1", detail.QueueID)
+	assert.Equal(t, StreamACP, detail.Stream)
+	assert.Equal(t, int64(1), detail.Seq)
+	assert.Equal(t, int64(1010), detail.AppliedThrough)
+	assert.Contains(t, err.Error(), "preserve the journal")
+	assert.False(t, dispatched)
+	assert.Equal(t, 1, sink.listCalls)
+	assert.Equal(t, original, sink.inboundReplay)
+	assert.Empty(t, sink.callSnapshot())
+	assert.NotContains(t, err.Error(), "do not include payload")
 }
 
 func TestInboundReplayKeepsLegacyStoreSemanticsThroughProducerWriteBehind(t *testing.T) {
@@ -150,6 +184,117 @@ func TestInboundReplayReturnsDurableWatermarkReadError(t *testing.T) {
 	assert.Zero(t, sink.listCalls)
 }
 
+func TestInboundReceiveCheckpointErrorDoesNotSubmitACK(t *testing.T) {
+	// Given an atomic journal guard rejects the inconsistent checkpoint.
+	store := &checkpointErrorStore{spyStore: newSpyStore()}
+	producer := newEngineTestProducer(t, store)
+	store.resetCalls()
+	beforeACK, beforeSignal := producer.inboundACK.Load(), producer.ackSignal.Load()
+	engine := NewEngine(Config{}, store, producer, DispatcherFunc(func(context.Context, Frame) error {
+		t.Fatal("an inconsistent checkpoint must not dispatch")
+		return nil
+	}))
+
+	// When a peer retries a frame at or below the applied watermark.
+	err := engine.Receive(context.Background(), EnvelopeFromFrame(testFrame(1, DirectionInbound, FrameKindData)))
+
+	// Then receipt fails before the producer can submit any cumulative ACK.
+	require.ErrorIs(t, err, ErrInboundHistoryInconsistent)
+	assert.Equal(t, beforeACK, producer.inboundACK.Load())
+	assert.Equal(t, beforeSignal, producer.ackSignal.Load())
+	assert.Equal(t, []string{"SaveInboundIfAbsent:1"}, store.callSnapshot())
+}
+
+type checkpointErrorStore struct{ *spyStore }
+
+func (s *checkpointErrorStore) SaveInboundIfAbsent(_ context.Context, frame Frame) (bool, Frame, error) {
+	s.record("SaveInboundIfAbsent:" + itoa(frame.Key.Seq))
+	return false, Frame{}, &InboundHistoryError{
+		QueueID: frame.Key.QueueID, Stream: frame.Key.Stream,
+		AppliedThrough: 2, AckedThrough: 0,
+	}
+}
+
+func TestInboundReplayRechecksAcknowledgedGapBeforeReportingInconsistentHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fresh     QueueState
+		readErr   error
+		wantErr   error
+		wantCalls []int64
+		wantPages int
+	}{
+		{name: "concurrent dispatcher advanced", fresh: QueueState{InboundAppliedThrough: 1, InboundAckedThrough: 2}, wantCalls: []int64{2}, wantPages: 2},
+		{name: "receipt cursor was reconciled", fresh: QueueState{}, wantPages: 1},
+		{name: "checkpoint read failed", readErr: errors.New("checkpoint unavailable"), wantPages: 1},
+		{name: "checkpoint became inconsistent", fresh: QueueState{InboundAppliedThrough: 2, InboundAckedThrough: 1}, wantErr: ErrInboundHistoryInconsistent, wantPages: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given a gap observed using an earlier queue-state snapshot.
+			store := &changingReplayStore{
+				orderedReplayStore: orderedReplayStore{boundedReplayStore: boundedReplayStore{spyStore: newSpyStore()}},
+				fresh:              tc.fresh, readErr: tc.readErr,
+			}
+			store.inboundReplay = []Frame{testFrame(2, DirectionInbound, FrameKindData)}
+			var dispatched []int64
+			engine := NewEngine(Config{}, store, nil, DispatcherFunc(func(_ context.Context, frame Frame) error {
+				dispatched = append(dispatched, frame.Key.Seq)
+				return nil
+			}))
+
+			// When recovery reloads the checkpoint before classifying the gap.
+			err := engine.ReplayInbound(context.Background(), "conn_1", StreamACP, 1000)
+
+			// Then current durable state governs recovery without a false corruption error.
+			if tc.readErr != nil {
+				assert.ErrorIs(t, err, tc.readErr)
+			} else if tc.wantErr != nil {
+				assert.ErrorIs(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantCalls, dispatched)
+			assert.Equal(t, tc.wantPages, store.listCalls)
+			assert.Equal(t, 2, store.stateLoads)
+			assert.NotContains(t, store.callSnapshot(), "MarkApplied:1")
+		})
+	}
+}
+
+type changingReplayStore struct {
+	orderedReplayStore
+	fresh   QueueState
+	readErr error
+}
+
+func TestInboundReplayRechecksEmptyTailAfterConcurrentDispatcherProgress(t *testing.T) {
+	// Given another dispatcher completed the acknowledged tail after the first read.
+	store := &changingReplayStore{
+		orderedReplayStore: orderedReplayStore{boundedReplayStore: boundedReplayStore{spyStore: newSpyStore()}},
+		fresh:              QueueState{InboundAppliedThrough: 2, InboundAckedThrough: 2},
+	}
+	engine := NewEngine(Config{}, store, nil, DispatcherFunc(func(context.Context, Frame) error {
+		t.Fatal("concurrently applied frames must not dispatch again")
+		return nil
+	}))
+
+	// When the received-row query observes the already completed history.
+	err := engine.ReplayInbound(context.Background(), "conn_1", StreamACP, 1000)
+
+	// Then a fresh checkpoint prevents a false missing-tail diagnosis.
+	require.NoError(t, err)
+	assert.Equal(t, 2, store.stateLoads)
+	assert.Empty(t, store.callSnapshot())
+}
+
+func (s *changingReplayStore) LoadQueueState(context.Context, string, Stream) (QueueState, error) {
+	s.stateLoads++
+	if s.stateLoads == 1 {
+		return QueueState{InboundAckedThrough: 2}, nil
+	}
+	return s.fresh, s.readErr
+}
+
 type boundedReplayStore struct {
 	*spyStore
 	listCalls int
@@ -182,5 +327,5 @@ type orderedReplayStore struct {
 
 func (s *orderedReplayStore) LoadQueueState(context.Context, string, Stream) (QueueState, error) {
 	s.stateLoads++
-	return QueueState{NextOutboundSeq: 1, InboundAppliedThrough: s.appliedThrough}, s.stateErr
+	return QueueState{NextOutboundSeq: 1, InboundAppliedThrough: s.appliedThrough, InboundAckedThrough: s.appliedThrough}, s.stateErr
 }

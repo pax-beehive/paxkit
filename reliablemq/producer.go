@@ -79,6 +79,7 @@ type Producer struct {
 	generationStat           atomic.Uint64
 	boundStat                atomic.Bool
 	lastError                atomic.Value
+	closeResult              atomic.Value
 }
 
 type ProducerBinding struct {
@@ -330,21 +331,31 @@ func (p *Producer) accept(ctx context.Context, entry acceptedOutbound) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if p.state.Load() != producerStateReady {
-		return p.stateError()
-	}
-
-	p.accepting.Add(1)
-	if p.state.Load() != producerStateReady {
-		p.accepting.Add(-1)
-		return p.stateError()
+	if err := p.beginAcceptance(); err != nil {
+		return err
 	}
 	entry.payload = append([]byte(nil), entry.payload...)
 	entry.metadata = entry.metadata.Clone()
 	p.ingress.Push(entry)
+	p.finishAcceptance()
+	return nil
+}
+
+func (p *Producer) beginAcceptance() error {
+	if p == nil || p.state.Load() != producerStateReady {
+		return p.stateError()
+	}
+	p.accepting.Add(1)
+	if p.state.Load() != producerStateReady {
+		p.finishAcceptance()
+		return p.stateError()
+	}
+	return nil
+}
+
+func (p *Producer) finishAcceptance() {
 	p.accepting.Add(-1)
 	p.signalWake()
-	return nil
 }
 
 func (p *Producer) Bind(
@@ -442,14 +453,15 @@ func (p *Producer) AdvanceProducerNextSeq(ctx context.Context, nextSeq int64) er
 }
 
 func (p *Producer) acknowledge(through int64) error {
-	if p == nil || p.state.Load() != producerStateReady {
-		return p.stateError()
+	if err := p.beginAcceptance(); err != nil {
+		return err
 	}
 	if through <= 0 {
+		p.finishAcceptance()
 		return fmt.Errorf("%w: ACK seq must be positive", ErrInvalidEnvelope)
 	}
 	atomicMaxInt64(&p.peerACK, through)
-	p.signalWake()
+	p.finishAcceptance()
 	return nil
 }
 
@@ -457,12 +469,12 @@ func (p *Producer) submitInboundACK(through int64) error {
 	if through <= 0 {
 		return nil
 	}
-	if p == nil || p.state.Load() != producerStateReady {
-		return p.stateError()
+	if err := p.beginAcceptance(); err != nil {
+		return err
 	}
 	atomicMaxInt64(&p.inboundACK, through)
 	p.ackSignal.Add(1)
-	p.signalWake()
+	p.finishAcceptance()
 	return nil
 }
 
@@ -498,7 +510,7 @@ func (p *Producer) Close(ctx context.Context) error {
 		state := p.state.Load()
 		switch state {
 		case producerStateClosed:
-			return nil
+			return p.closeError()
 		case producerStateClosing:
 		case producerStateReady, producerStateFailed:
 			if !p.state.CompareAndSwap(state, producerStateClosing) {
@@ -515,10 +527,17 @@ func (p *Producer) Close(ctx context.Context) error {
 	}
 	select {
 	case <-p.done:
-		return nil
+		return p.closeError()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (p *Producer) closeError() error {
+	if value := p.closeResult.Load(); value != nil {
+		return value.(producerErrorValue).err
+	}
+	return nil
 }
 
 func (b *ProducerBinding) Close() {
@@ -627,7 +646,14 @@ func (p *Producer) run(ctx context.Context, state producerOwnerState) {
 
 		if p.state.Load() == producerStateClosing &&
 			p.accepting.Load() == 0 && p.ingress.Empty() {
-			p.disableBinding(&state, ErrProducerClosed)
+			// Accepted ACKs may have arrived after this iteration's first read.
+			err := p.applyACKSignals(&state)
+			if err != nil {
+				p.closeResult.Store(producerErrorValue{err: err})
+				p.lastError.Store(producerErrorValue{err: err})
+			}
+			p.publishStats(&state)
+			p.disableBinding(&state, errors.Join(ErrProducerClosed, err))
 			p.state.Store(producerStateClosed)
 			p.cancel()
 			p.signalProgress()
@@ -710,7 +736,7 @@ func (p *Producer) sequenceIngress(state *producerOwnerState) {
 	}
 }
 
-func (p *Producer) applyACKSignals(state *producerOwnerState) {
+func (p *Producer) applyACKSignals(state *producerOwnerState) error {
 	peerThrough := p.peerACK.Load()
 	if peerThrough > state.ackedThrough {
 		if err := p.store.AckOutboundThrough(
@@ -719,8 +745,9 @@ func (p *Producer) applyACKSignals(state *producerOwnerState) {
 			p.config.Stream,
 			peerThrough,
 		); err != nil {
-			p.fail(state, fmt.Errorf("persist cumulative ACK: %w", err))
-			return
+			err = fmt.Errorf("persist cumulative ACK: %w", err)
+			p.fail(state, err)
+			return err
 		}
 		state.ackedThrough = peerThrough
 		if state.nextToSend <= peerThrough {
@@ -741,6 +768,7 @@ func (p *Producer) applyACKSignals(state *producerOwnerState) {
 	if ackSignal > state.pendingACKSignal {
 		state.pendingACKSignal = ackSignal
 	}
+	return nil
 }
 
 func (p *Producer) refreshPersistence(state *producerOwnerState) {

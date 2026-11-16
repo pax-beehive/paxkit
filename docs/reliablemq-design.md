@@ -465,6 +465,14 @@ WebSocket attempt. `NewProducer` bootstraps sequence and checkpoint state before
 it becomes ready. `ProducerRegistry` owns and reuses one producer for each
 partition and closes producers before the store during process shutdown.
 
+Peer ACKs and inbound receipt signals share the producer's in-flight acceptance
+reservation with outbound entries. `Close` rejects new acceptance, waits for
+reserved publications, and drains ACK signals once more before the owner exits.
+It returns a final ACK persistence error rather than silently completing or
+retrying indefinitely. Hosts close the write-behind store afterward to flush
+accepted peer ACKs to the journal. This does not add a socket-flush guarantee for
+outgoing receipt ACKs.
+
 Accepted entries are copied into a non-blocking MPSC ingress. One owner
 goroutine assigns contiguous sequence numbers and owns mutable cursor state:
 
@@ -577,6 +585,34 @@ When the durable sink exposes `QueueStateStore`, the engine honors its inbound
 applied watermark through `ProducerWriteBehindStore.QueueStateStore()`. This
 optional capability is separate from the producer's buffered outbound checkpoint.
 Legacy sinks without durable queue cursors retain unordered replay semantics.
+
+Ordered recovery fails with `ErrInboundHistoryInconsistent` when a received row
+is at or below the persisted applied cursor. `InboundHistoryError` identifies the
+queue, stream, sequence and cursor without logging payload data. Older runtimes
+could advance the cursor past a failed dispatch; those remaining rows may contain
+commands that were never executed. Recovery does not discard, automatically retry,
+or mark them applied. Preserve the journal and inspect delivery state before an
+explicit repair. A full page of such rows cannot be reported as successful
+recovery while hiding later work. A host with an independently audited,
+application-specific cleanup policy may filter those rows in its own replay
+implementation; the shared library does not infer that policy.
+
+An observed replay gap is also inconsistent if the missing sequence is already
+covered by the durable receipt cursor. The engine reloads queue state before
+reporting it, so a concurrent dispatcher advancing the applied cursor does not
+cause a false error. A gap beyond the receipt cursor remains eligible for the
+peer to fill after reconciliation. Legacy terminal rows with a missing applied
+cursor are reported for inspection, not automatically replayed or repaired.
+The same check applies when replay reaches an empty result or a short final
+page: an acknowledged but unapplied tail cannot be treated as successful
+recovery merely because no higher row remains to expose the gap.
+
+An applied cursor above the durable receipt cursor is also inconsistent, even
+when no received rows remain. Replay checks that invariant before reading the
+journal. Memory and SQL receive paths check it atomically with the existing
+checkpoint read, before duplicate handling, insertion, or ACK submission. A peer
+retry does not rebuild the receipt cursor from an uncertain applied watermark;
+the error preserves all rows and cursors for explicit recovery.
 
 ## Typical paxd Usage
 
